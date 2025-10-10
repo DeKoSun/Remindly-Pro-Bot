@@ -5,7 +5,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command
-from aiogram.types import Update
+from aiogram.types import Update, BotCommand
 from aiogram.utils.chat_action import ChatActionSender
 from db import upsert_chat, set_tournament_subscription, add_reminder, get_active_reminders, delete_reminder_by_id, set_paused
 from scheduler_core import TournamentScheduler, UniversalReminderScheduler
