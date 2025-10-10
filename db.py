@@ -3,6 +3,16 @@ import os
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
+from supabase import create_client
+import os
+from db import supabase, get_tournament_subscribed_chats
+
+# Загружаем ключи из переменных окружения
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+# Создаём клиент Supabase
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
