@@ -12,7 +12,13 @@ from apscheduler.triggers.cron import CronTrigger
 from aiogram import Bot
 
 from texts import pick_phrase, TOURNAMENT_VARIANTS
-from db import get_tournament_subscribed_chats, supabase
+from db import (
+    get_tournament_subscribed_chats,
+    supabase,
+    get_due_once_and_recurring,
+    advance_recurring,
+    get_user_prefs,
+)
 
 logger = logging.getLogger("remindly")
 
@@ -112,23 +118,59 @@ class UniversalReminderScheduler:
             now = datetime.now(timezone.utc)
             window_start = now - timedelta(minutes=self.late_delivery_min)
 
-            res = (
-                supabase.table("reminders")
-                .select("*")
-                .lte("remind_at", now.isoformat())
-                .gte("remind_at", window_start.isoformat())
-                .eq("paused", False)
-                .execute()
-            )
-            reminders = res.data or []
+            # забираем due once + due cron по нашему окну
+            once, recur = get_due_once_and_recurring(window_start.isoformat(), now.isoformat())
+            due: list[tuple[str, dict]] = []
+            due.extend(("once", r) for r in (once or []))
+            due.extend(("cron", r) for r in (recur or []))
 
-            for r in reminders:
+            for kind, r in due:
                 try:
-                    await self.bot.send_message(
-                        r["chat_id"], f"⏰ Напоминание: <b>{r['text']}</b>"
-                    )
-                    logger.info(f"sent reminder id={r['id']} chat_id={r['chat_id']}")
-                    supabase.table("reminders").delete().eq("id", r["id"]).execute()
+                    # учёт пользовательских настроек (таймзона/тихие часы)
+                    prefs = get_user_prefs(r["user_id"])
+                    tz_name = (prefs.get("tz_name") or "Europe/Moscow") if prefs else "Europe/Moscow"
+                    quiet_from = prefs.get("quiet_from") if prefs else None
+                    quiet_to = prefs.get("quiet_to") if prefs else None
+
+                    if quiet_from is not None and quiet_to is not None:
+                        user_tz = pytz.timezone(tz_name)
+                        local_now_hour = datetime.now(user_tz).hour
+                        in_quiet = (
+                            (quiet_from <= quiet_to and quiet_from <= local_now_hour < quiet_to)
+                            or (quiet_from > quiet_to and (local_now_hour >= quiet_from or local_now_hour < quiet_to))
+                        )
+                        if in_quiet:
+                            # переносим на конец «тихого окна»
+                            target_local = datetime.now(user_tz).replace(
+                                hour=quiet_to, minute=0, second=0, microsecond=0
+                            )
+                            if target_local < datetime.now(user_tz):
+                                target_local += timedelta(days=1)
+                            target_utc = target_local.astimezone(timezone.utc)
+
+                            if kind == "once":
+                                supabase.table("reminders").update(
+                                    {"remind_at": target_utc.isoformat()}
+                                ).eq("id", r["id"]).execute()
+                            else:
+                                supabase.table("reminders").update(
+                                    {"next_at": target_utc.isoformat()}
+                                ).eq("id", r["id"]).execute()
+                            logger.info(
+                                f"defer reminder id={r['id']} to {target_utc.isoformat()} due to quiet hours"
+                            )
+                            continue
+
+                    # отправляем
+                    await self.bot.send_message(r["chat_id"], f"⏰ Напоминание: <b>{r['text']}</b>")
+                    logger.info(f"sent reminder id={r['id']} chat_id={r['chat_id']} kind={kind}")
+
+                    # пост-действия
+                    if kind == "once":
+                        supabase.table("reminders").delete().eq("id", r["id"]).execute()
+                    else:
+                        advance_recurring(r["id"], r["cron_expr"])
+
                 except Exception as e:
                     logger.exception(f"Ошибка при отправке напоминания id={r.get('id')}: {e}")
 

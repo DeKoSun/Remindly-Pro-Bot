@@ -22,6 +22,14 @@ from db import (
     get_active_reminders,
     delete_reminder_by_id,
     set_paused,
+    # новое:
+    add_recurring_reminder,
+    set_user_tz,
+    set_quiet_hours,
+    has_editor_role,
+    grant_role,
+    revoke_role,
+    list_roles,
 )
 from scheduler_core import TournamentScheduler, UniversalReminderScheduler
 from texts import HELP_TEXT
@@ -79,7 +87,6 @@ def _parse_when(text: str) -> datetime | None:
             hh, mm = map(int, hhmm.split(":"))
         except Exception:
             return None
-        # считаем «завтра» по UTC (просто +1 день к сегодняшней дате UTC)
         dt = datetime.now(timezone.utc).replace(hour=hh, minute=mm, second=0, microsecond=0) + timedelta(days=1)
         return dt
 
@@ -119,7 +126,6 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
     except Exception:
         logger.exception("Webhook handler failed")
-        # Возвращаем 200, чтобы Telegram не считал ошибку как 502
         return {"ok": True}
 
 @app.get("/")
@@ -152,10 +158,15 @@ async def on_startup():
             BotCommand(command="delete", description="Удалить напоминание"),
             BotCommand(command="pause", description="Пауза напоминания"),
             BotCommand(command="resume", description="Возобновить напоминание"),
+            # новые:
+            BotCommand(command="add_repeat", description="Повторяющееся напоминание"),
+            BotCommand(command="set_tz", description="Установить таймзону"),
+            BotCommand(command="quiet", description="Тихие часы"),
+            BotCommand(command="role", description="Роли в чате"),
         ]
     )
 
-# ======================= Проверка прав администратора =================
+# ======================= Проверка прав ===============================
 async def _is_admin(message: types.Message) -> bool:
     if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         await message.answer("Эта команда доступна только в групповых чатах.")
@@ -166,12 +177,21 @@ async def _is_admin(message: types.Message) -> bool:
         return False
     return True
 
+async def _is_editor_or_admin(message: types.Message) -> bool:
+    # в личке — всегда ок
+    if message.chat.type == ChatType.PRIVATE:
+        return True
+    # в группе: админ телеги или редактор из нашей таблицы
+    member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+    if member.is_chat_admin() or member.is_chat_creator():
+        return True
+    return has_editor_role(message.chat.id, message.from_user.id)
+
 # ======================= Команды для турниров =======================
 @dp.message(Command("subscribe_tournaments"))
 async def cmd_subscribe_tournaments(m: types.Message):
     if not await _is_admin(m):
         return
-    # Сохраним чат в БД и включим подписку
     await m.chat.do(ChatActionSender.typing())
     upsert_chat(chat_id=m.chat.id, type_=m.chat.type, title=m.chat.title)
     set_tournament_subscription(chat_id=m.chat.id, value=True)
@@ -192,7 +212,7 @@ async def cmd_tourney_now(m: types.Message):
     if not await _is_admin(m):
         return
     now = datetime.now()
-    display = time(now.hour, (now.minute // 5) * 5)  # округлим до 5 минут
+    display = time(now.hour, (now.minute // 5) * 5)
     await m.answer("🚀 Отправляю пробное напоминание турнира прямо сейчас…")
     await _tourney._send_tournament(m.chat.id, display)
 
@@ -200,11 +220,10 @@ async def cmd_tourney_now(m: types.Message):
 async def cmd_schedule(m: types.Message):
     now = _msk_now()
     today = now.date()
-    # соберём ближайшие слоты с «напоминанием за 5 минут»
     slots: list[tuple[datetime, datetime]] = []
     for t in TOURNEY_SLOTS:
         dt = now.tzinfo.localize(datetime.combine(today, t))
-        if t == time(0, 0):  # полночь => следующий день
+        if t == time(0, 0):
             dt = dt + timedelta(days=1)
         reminder = dt - timedelta(minutes=5)
         if reminder >= now:
@@ -235,7 +254,10 @@ async def add_start(message: types.Message, state: FSMContext):
 async def add_got_text(message: types.Message, state: FSMContext):
     await state.update_data(text=message.text.strip())
     await state.set_state(AddReminder.waiting_for_time)
-    await message.answer("⏰ Когда напомнить?\nПримеры: <code>14:30</code> • <code>завтра 10:00</code> • <code>через 25 минут</code> • <code>через 2 часа</code>")
+    await message.answer(
+        "⏰ Когда напомнить?\n"
+        "Примеры: <code>14:30</code> • <code>завтра 10:00</code> • <code>через 25 минут</code> • <code>через 2 часа</code>"
+    )
 
 @dp.message(AddReminder.waiting_for_time)
 async def add_got_time(message: types.Message, state: FSMContext):
@@ -259,9 +281,10 @@ async def cmd_list(message: types.Message):
     lines = ["📋 Твои напоминания:"]
     for r in items:
         rid = str(r["id"])[:8]
-        when = r["remind_at"]
+        when = r.get("remind_at") or r.get("next_at") or "—"
+        kind = r.get("kind", "once")
         paused = "⏸️" if r.get("paused") else "▶️"
-        lines.append(f"• <code>{rid}</code> [{paused}] — {r['text']} — {when}")
+        lines.append(f"• <code>{rid}</code> [{paused}] ({kind}) — {r['text']} — {when}")
     await message.answer("\n".join(lines))
 
 @dp.message(Command("delete"))
@@ -293,3 +316,118 @@ async def cmd_resume(message: types.Message):
     rid = parts[1]
     set_paused(rid, False)
     await message.answer(f"▶️ Возобновил напоминание <code>{rid}</code>")
+
+# ======================= Повторяющиеся напоминания ===================
+@dp.message(Command("add_repeat"))
+async def cmd_add_repeat(m: types.Message):
+    if not await _is_editor_or_admin(m):
+        await m.answer("Недостаточно прав для создания повторяющихся напоминаний.")
+        return
+
+    # /add_repeat <тип> <HH:MM> Текст
+    # тип: daily | weekdays | sunday | cron
+    parts = m.text.strip().split()
+    if len(parts) < 3:
+        await m.answer(
+            "Примеры:\n"
+            "/add_repeat daily 10:00 Собрание\n"
+            "/add_repeat weekdays 09:45 Стендап\n"
+            "/add_repeat sunday 20:00 Отчёт\n"
+            "/add_repeat cron \"*/15 * * * *\" Пульс-чек"
+        )
+        return
+
+    mode = parts[1].lower()
+    if mode == "cron":
+        # /add_repeat cron "*/15 * * * *" Текст...
+        cron_expr = parts[2].strip('"').strip("'")
+        text = " ".join(parts[3:]).strip()
+    else:
+        try:
+            hh, mm = map(int, parts[2].split(":"))
+        except Exception:
+            await m.answer("Формат времени: HH:MM")
+            return
+        if mode == "daily":
+            cron_expr = f"{mm} {hh} * * *"
+        elif mode == "weekdays":
+            cron_expr = f"{mm} {hh} 1-5 * *"
+        elif mode == "sunday":
+            cron_expr = f"{mm} {hh} * * 0"
+        else:
+            await m.answer("Тип должен быть: daily | weekdays | sunday | cron")
+            return
+        text = " ".join(parts[3:]).strip()
+
+    if not text:
+        await m.answer("Добавь текст напоминания.")
+        return
+
+    add_recurring_reminder(m.from_user.id, m.chat.id, text, cron_expr)
+    await m.answer(f"✅ Создал повторяющееся напоминание:\n<b>{text}</b>\nCRON: <code>{cron_expr}</code>")
+
+# ======================= Таймзона и «тихие часы» =====================
+@dp.message(Command("set_tz"))
+async def cmd_set_tz(m: types.Message):
+    parts = m.text.strip().split()
+    if len(parts) < 2:
+        await m.answer("Укажи таймзону, например: /set_tz Europe/Moscow")
+        return
+    set_user_tz(m.from_user.id, parts[1])
+    await m.answer(f"Таймзона обновлена: {parts[1]}")
+
+@dp.message(Command("quiet"))
+async def cmd_quiet(m: types.Message):
+    parts = m.text.strip().split()
+    if len(parts) < 2:
+        await m.answer("Формат: /quiet HH-HH  или /quiet off")
+        return
+    arg = parts[1].lower()
+    if arg == "off":
+        set_quiet_hours(m.from_user.id, None, None)
+        await m.answer("Тихие часы отключены.")
+        return
+    try:
+        qf, qt = arg.split("-")
+        set_quiet_hours(m.from_user.id, int(qf), int(qt))
+        await m.answer(f"Тихие часы установлены: {qf}:00–{qt}:00")
+    except Exception:
+        await m.answer("Формат: /quiet 23-8  или /quiet off")
+
+# ======================= Роли в чате ================================
+@dp.message(Command("role"))
+async def cmd_role(m: types.Message):
+    # /role list
+    # /role grant <user_id> editor
+    # /role revoke <user_id>
+    parts = m.text.strip().split()
+    if len(parts) == 2 and parts[1].lower() == "list":
+        rows = list_roles(m.chat.id)
+        if not rows:
+            await m.answer("В этом чате нет дополнительных ролей.")
+            return
+        lines = ["Роли чата:"]
+        for r in rows:
+            lines.append(f"• user_id={r['user_id']} → {r['role']}")
+        await m.answer("\n".join(lines))
+        return
+
+    if len(parts) >= 3 and parts[1].lower() in ("grant", "revoke"):
+        # только телеграм-админ может управлять ролями
+        if not await _is_admin(m):
+            return
+        try:
+            target_id = int(parts[2].replace("@", ""))
+        except ValueError:
+            await m.answer("Пока поддерживаю формат: /role grant <user_id> editor")
+            return
+        if parts[1].lower() == "grant":
+            role = parts[3] if len(parts) > 3 else "editor"
+            grant_role(m.chat.id, target_id, role)
+            await m.answer(f"Выдал роль {role} пользователю {target_id}.")
+        else:
+            revoke_role(m.chat.id, target_id)
+            await m.answer(f"Снял роли с пользователя {target_id}.")
+        return
+
+    await m.answer("Форматы:\n/role list\n/role grant <user_id> editor\n/role revoke <user_id>")
