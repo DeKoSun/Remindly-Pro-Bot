@@ -8,8 +8,9 @@ from aiogram.filters import Command
 from aiogram.types import Update
 from aiogram.utils.chat_action import ChatActionSender
 from db import upsert_chat, set_tournament_subscription
-from scheduler_core import TournamentScheduler
+from scheduler_core import TournamentScheduler, UniversalReminderScheduler
 from texts import HELP_TEXT
+from datetime import datetime, time
 
 # === Конфигурация ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -60,10 +61,25 @@ async def health():
 @app.on_event("startup")
 async def on_startup():
     _tourney.start()
+    _universal = UniversalReminderScheduler(bot)
+    _universal.start()
+
     await bot.set_webhook(
         url=f"{PUBLIC_BASE_URL}/{WEBHOOK_SECRET}",
         drop_pending_updates=True
     )
+
+    await bot.set_my_commands([
+        BotCommand(command="help", description="Показать команды"),
+        BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
+        BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
+        BotCommand(command="tourney_now", description="Прислать пробное напоминание турнира"),
+        BotCommand(command="add", description="Создать напоминание"),
+        BotCommand(command="list", description="Список напоминаний"),
+        BotCommand(command="delete", description="Удалить напоминание"),
+        BotCommand(command="pause", description="Пауза напоминания"),
+        BotCommand(command="resume", description="Возобновить напоминание"),
+    ])
 
 # === Проверка прав администратора ===
 async def _is_admin(message: types.Message) -> bool:
@@ -102,3 +118,13 @@ async def cmd_unsubscribe_tournaments(m: types.Message):
 @dp.message(Command("test"))
 async def cmd_test(m: types.Message):
     await m.answer("✅ Я на связи. Вебхук активен, расписание турниров запущено.")
+@dp.message(Command("tourney_now"))
+async def cmd_tourney_now(m: types.Message):
+    # Только для админов групп
+    if not await _is_admin(m):
+        return
+    now = datetime.now()
+    # Передаём в отправку «время старта», чтобы текст был корректным
+    display = time(now.hour, (now.minute // 5) * 5)  # округлим до 5 минут
+    await m.answer("🚀 Отправляю пробное напоминание турнира прямо сейчас…")
+    await _tourney._send_tournament(m.chat.id, display)

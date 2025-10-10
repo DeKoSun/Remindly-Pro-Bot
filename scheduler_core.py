@@ -1,7 +1,8 @@
 # FILE: scheduler_core.py
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 import pytz
+import asyncio
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -11,6 +12,7 @@ from apscheduler.jobstores.memory import MemoryJobStore
 from aiogram import Bot
 from texts import pick_phrase, TOURNAMENT_VARIANTS
 from db import get_tournament_subscribed_chats
+from db import supabase 
 
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Europe/Moscow")
 TITLE_TOURNAMENT = "Быстрый турнир"
@@ -81,3 +83,29 @@ class TournamentScheduler:
             chat_id = r[0]
             tz_name = r[1]
             self._register_daily_jobs_for_chat(chat_id, tz_name)
+class UniversalReminderScheduler:
+    def __init__(self, bot):
+        self.bot = bot
+        self._task = None
+
+    async def _check_reminders(self):
+        while True:
+            now = datetime.now(timezone.utc)
+            # берём все напоминания, где время уже настало и не на паузе
+            res = supabase.table("reminders").select("*").lte("remind_at", now.isoformat()).eq("paused", False).execute()
+            reminders = res.data or []
+
+            for r in reminders:
+                try:
+                    await self.bot.send_message(r["chat_id"], f"⏰ Напоминание: <b>{r['text']}</b>")
+                    logger.info(f"sent reminder id={r['id']} chat_id={r['chat_id']}")
+                    # после отправки — удалить
+                    supabase.table("reminders").delete().eq("id", r["id"]).execute()
+                except Exception as e:
+                    print(f"Ошибка при отправке напоминания: {e}")
+
+            await asyncio.sleep(60)  # проверка каждую минуту
+
+    def start(self):
+        if not self._task:
+            self._task = asyncio.create_task(self._check_reminders())
