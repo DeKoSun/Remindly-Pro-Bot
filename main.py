@@ -20,7 +20,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
 
 if not BOT_TOKEN or not PUBLIC_BASE_URL:
-raise RuntimeError("TELEGRAM_BOT_TOKEN and PUBLIC_BASE_URL must be set")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN and PUBLIC_BASE_URL must be set")
 
 
 app = FastAPI()
