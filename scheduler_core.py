@@ -1,93 +1,74 @@
-# main.py  — aiogram v2.25.2
 import os
-import json
-import logging
+from datetime import datetime, time
+import pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.executors.asyncio import AsyncIOExecutor
+from apscheduler.jobstores.memory import MemoryJobStore
+from aiogram import Bot
+from texts import pick_phrase, TOURNAMENT_VARIANTS
+from db import get_tournament_subscribed_chats
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO)
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "America/New_York")
+TITLE_TOURNAMENT = "Быстрый турнир"
 
-# ---------- ENV ----------
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://github-production-83c6.up.railway.app/")  # <-- твой публичный HTTPS
 
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN is not set")
+# Турнирные времена (напоминание за 5 минут до начала):
+# Начала: 10:00, 12:00, 14:00, 16:00, 17:00 — значит уведомления: 09:55, 11:55, 13:55, 15:55, 16:55
+TOURNAMENT_MINUTES = [
+(9, 55), (11, 55), (13, 55), (15, 55), (16, 55)
+]
 
-# ---------- BOT/DP ----------
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
 
-# ---------- Supabase (опционально) ----------
-supabase = None
-try:
-    if SUPABASE_URL and SUPABASE_KEY:
-        from supabase import create_client
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logging.info("Supabase client initialized")
-    else:
-        logging.warning("SUPABASE_URL/SUPABASE_KEY не заданы — сохранение в БД отключено.")
-except Exception:
-    logging.exception("Не удалось инициализировать Supabase")
+class TournamentScheduler:
+def __init__(self, bot: Bot):
+self.bot = bot
+self.scheduler = AsyncIOScheduler(
+jobstores={"default": MemoryJobStore()},
+executors={"default": AsyncIOExecutor()},
+job_defaults={"misfire_grace_time": 86400}, # Ловим "пропуски" за сутки
+timezone=pytz.timezone(DEFAULT_TZ)
+)
 
-# ---------- Клавиатура с WebApp ----------
-def register_kb() -> ReplyKeyboardMarkup:
-    url = WEBAPP_URL.strip()
-    if not url.startswith("http"):
-        url = "https://" + url  # страховка, если забудем схему
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton(text="📝 Заполнить форму", web_app=WebAppInfo(url=url)))
-    return kb
 
-# ---------- Команды ----------
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привет! Нажми кнопку ниже, чтобы открыть форму регистрации.",
-        reply_markup=register_kb()
-    )
+def start(self):
+self.scheduler.start()
+# Ежеминутная проверка чатов и регистрация джобов по cron (без дублей)
+self.scheduler.add_job(self._ensure_tournament_jobs, CronTrigger.from_crontab("*/5 * * * *", timezone=self.scheduler.timezone))
+# Быстрый запуск при старте
+self.scheduler.add_job(self._ensure_tournament_jobs, next_run_time=datetime.now(self.scheduler.timezone))
 
-@dp.message_handler(commands=["register"])
-async def cmd_register(message: types.Message):
-    await message.answer(
-        "Нажми кнопку ниже, чтобы открыть форму регистрации:",
-        reply_markup=register_kb()
-    )
 
-# ---------- Приём данных из WebApp ----------
-@dp.message_handler(content_types=types.ContentType.WEB_APP_DATA)
-async def handle_webapp(message: types.Message):
-    try:
-        raw = message.web_app_data.data or "{}"
-        data = json.loads(raw)
-        logging.info(f"WebApp data from {message.from_user.id}: {data}")
+async def _send_tournament(self, chat_id: int, notify_time: time):
+# notify_time — это время начала турнира (10:00 и т.п.), мы показываем его в тексте
+start_str = notify_time.strftime("%H:%M")
+text = pick_phrase(TOURNAMENT_VARIANTS, title=TITLE_TOURNAMENT, time=start_str)
+await self.bot.send_message(chat_id, text)
 
-        # Сохраняем в Supabase, если включено
-        if supabase:
-            payload = {
-                "telegram_id": str(message.from_user.id),
-                "nickname": data.get("nickname"),
-                "telegram": data.get("telegram"),
-                "expectations": data.get("expectations"),
-                "play_other": data.get("play_other"),
-                "clan_life": data.get("clan_life"),
-                # Если у тебя колонка JSON/array — оставляй как есть, иначе сериализуй строкой:
-                "decks": data.get("decks"),
-            }
-            res = supabase.table("players").insert(payload).execute()
-            logging.info(f"Supabase insert result: {res}")
 
-        await message.answer("✅ Регистрация получена! Спасибо.")
-    except Exception:
-        logging.exception("Ошибка в обработчике WEB_APP_DATA")
-        await message.answer("❌ Произошла ошибка. Попробуй ещё раз позже.")
+def _register_daily_jobs_for_chat(self, chat_id: int, tz_name: str):
+tz = pytz.timezone(tz_name or DEFAULT_TZ)
+# Создаём 5 ежедневных cron-задач (дедупликация через job_id)
+for hour, minute in TOURNAMENT_MINUTES:
+start_hour = hour + (0 if minute == 55 else 0) # actual start hours mapping already embedded
+# Соответствующее реальное начало турнира для текста
+start_display = { (9,55): (10,0), (11,55): (12,0), (13,55): (14,0), (15,55): (16,0), (16,55): (17,0) }[(hour,minute)]
+job_id = f"tour_{chat_id}_{hour:02d}{minute:02d}"
+# Удаляем старую, если есть (обновление tz/cron)
+old = self.scheduler.get_job(job_id)
+if old:
+old.remove()
+self.scheduler.add_job(
+self._send_tournament,
+CronTrigger(hour=hour, minute=minute, timezone=tz),
+id=job_id,
+args=[chat_id, time(*start_display)]
+)
 
-# ---------- RUN ----------
-if __name__ == "__main__":
-    logging.info("Bot starting…")
-    executor.start_polling(dp, skip_updates=True)
+
+def _ensure_tournament_jobs(self):
+# читаем все подписанные чаты и гарантируем наличие джобов
+rows = get_tournament_subscribed_chats()
+for r in rows:
+self._register_daily_jobs_for_chat(r[0], r[1])

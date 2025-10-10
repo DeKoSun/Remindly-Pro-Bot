@@ -1,93 +1,56 @@
-# main.py  — aiogram v2.25.2
 import os
-import json
-import logging
-
+import asyncio
+from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import ChatJoinRequest
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiogram.webhook.serializers.json import JSONSerializer
+from aiogram.filters import Command
+from texts import HELP_TEXT, pick_phrase, REMINDER_VARIANTS
+from utils import is_admin, DEFAULT_TZ
+from db import upsert_chat, set_tournament_subscription, create_reminder, list_reminders, set_active, delete_reminder
+from scheduler_core import TournamentScheduler
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO)
 
-# ---------- ENV ----------
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://github-production-83c6.up.railway.app/")  # <-- твой публичный HTTPS
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "webhook")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN is not set")
 
-# ---------- BOT/DP ----------
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+if not BOT_TOKEN or not PUBLIC_BASE_URL:
+raise RuntimeError("TELEGRAM_BOT_TOKEN and PUBLIC_BASE_URL must be set")
 
-# ---------- Supabase (опционально) ----------
-supabase = None
-try:
-    if SUPABASE_URL and SUPABASE_KEY:
-        from supabase import create_client
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logging.info("Supabase client initialized")
-    else:
-        logging.warning("SUPABASE_URL/SUPABASE_KEY не заданы — сохранение в БД отключено.")
-except Exception:
-    logging.exception("Не удалось инициализировать Supabase")
 
-# ---------- Клавиатура с WebApp ----------
-def register_kb() -> ReplyKeyboardMarkup:
-    url = WEBAPP_URL.strip()
-    if not url.startswith("http"):
-        url = "https://" + url  # страховка, если забудем схему
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton(text="📝 Заполнить форму", web_app=WebAppInfo(url=url)))
-    return kb
+app = FastAPI()
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
-# ---------- Команды ----------
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привет! Нажми кнопку ниже, чтобы открыть форму регистрации.",
-        reply_markup=register_kb()
-    )
 
-@dp.message_handler(commands=["register"])
-async def cmd_register(message: types.Message):
-    await message.answer(
-        "Нажми кнопку ниже, чтобы открыть форму регистрации:",
-        reply_markup=register_kb()
-    )
+# Scheduler
+_tourney = TournamentScheduler(bot)
 
-# ---------- Приём данных из WebApp ----------
-@dp.message_handler(content_types=types.ContentType.WEB_APP_DATA)
-async def handle_webapp(message: types.Message):
-    try:
-        raw = message.web_app_data.data or "{}"
-        data = json.loads(raw)
-        logging.info(f"WebApp data from {message.from_user.id}: {data}")
 
-        # Сохраняем в Supabase, если включено
-        if supabase:
-            payload = {
-                "telegram_id": str(message.from_user.id),
-                "nickname": data.get("nickname"),
-                "telegram": data.get("telegram"),
-                "expectations": data.get("expectations"),
-                "play_other": data.get("play_other"),
-                "clan_life": data.get("clan_life"),
-                # Если у тебя колонка JSON/array — оставляй как есть, иначе сериализуй строкой:
-                "decks": data.get("decks"),
-            }
-            res = supabase.table("players").insert(payload).execute()
-            logging.info(f"Supabase insert result: {res}")
+@dp.message(Command("start"))
+async def cmd_start(m: types.Message):
+await m.answer("Бот готов. /help — список команд.")
 
-        await message.answer("✅ Регистрация получена! Спасибо.")
-    except Exception:
-        logging.exception("Ошибка в обработчике WEB_APP_DATA")
-        await message.answer("❌ Произошла ошибка. Попробуй ещё раз позже.")
 
-# ---------- RUN ----------
-if __name__ == "__main__":
-    logging.info("Bot starting…")
-    executor.start_polling(dp, skip_updates=True)
+@dp.message(Command("help"))
+async def cmd_help(m: types.Message):
+await m.answer(HELP_TEXT)
+
+
+@dp.message(Command("subscribe_tournaments"))
+async def cmd_subscribe(m: types.Message):
+if m.chat.type not in ("group", "supergroup"):
+return await m.answer("Эта команда работает только в группе.")
+if not await is_admin(m):
+return await m.answer("Только администраторы группы могут управлять подпиской.")
+upsert_chat(m.chat.id, m.chat.type, m.chat.title)
+set_tournament_subscription(m.chat.id, True)
+await m.answer("Напоминания турниров включены в этом чате. Я пришлю уведомления за 5 минут до старта.")
+
+
+@dp.message(Command("unsubscribe_tournaments"))

@@ -1,93 +1,67 @@
-# main.py  — aiogram v2.25.2
-import os
-import json
-import logging
+-- Supabase uses Postgres; run this in the SQL editor or with psql.
+chat_id bigint PRIMARY KEY,
+type text NOT NULL, -- 'group', 'supergroup', etc.
+title text,
+tournament_subscribed boolean NOT NULL DEFAULT false,
+tz text NOT NULL DEFAULT 'America/New_York',
+created_at timestamptz NOT NULL DEFAULT now(),
+updated_at timestamptz NOT NULL DEFAULT now()
+);
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO)
+-- schedule_type: one_off | cron | preset
+CREATE TYPE schedule_type AS ENUM ('one_off', 'cron', 'preset');
 
-# ---------- ENV ----------
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://github-production-83c6.up.railway.app/")  # <-- твой публичный HTTPS
 
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN is not set")
+CREATE TABLE IF NOT EXISTS reminders (
+id bigserial PRIMARY KEY,
+owner_id bigint NOT NULL,
+chat_id bigint NOT NULL,
+title text NOT NULL,
+schedule_kind schedule_type NOT NULL,
+payload_json jsonb NOT NULL, -- stores cron expr, datetime, or preset name
+tz text NOT NULL DEFAULT 'America/New_York',
+is_active boolean NOT NULL DEFAULT true,
+next_run_at timestamptz,
+last_fired_at timestamptz,
+created_at timestamptz NOT NULL DEFAULT now(),
+updated_at timestamptz NOT NULL DEFAULT now()
+);
 
-# ---------- BOT/DP ----------
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
 
-# ---------- Supabase (опционально) ----------
-supabase = None
-try:
-    if SUPABASE_URL and SUPABASE_KEY:
-        from supabase import create_client
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logging.info("Supabase client initialized")
-    else:
-        logging.warning("SUPABASE_URL/SUPABASE_KEY не заданы — сохранение в БД отключено.")
-except Exception:
-    logging.exception("Не удалось инициализировать Supabase")
+CREATE INDEX IF NOT EXISTS reminders_active_idx ON reminders(is_active, next_run_at);
 
-# ---------- Клавиатура с WebApp ----------
-def register_kb() -> ReplyKeyboardMarkup:
-    url = WEBAPP_URL.strip()
-    if not url.startswith("http"):
-        url = "https://" + url  # страховка, если забудем схему
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton(text="📝 Заполнить форму", web_app=WebAppInfo(url=url)))
-    return kb
 
-# ---------- Команды ----------
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привет! Нажми кнопку ниже, чтобы открыть форму регистрации.",
-        reply_markup=register_kb()
-    )
+CREATE TABLE IF NOT EXISTS runs (
+id bigserial PRIMARY KEY,
+reminder_id bigint NOT NULL REFERENCES reminders(id) ON DELETE CASCADE,
+fired_at timestamptz NOT NULL,
+status text NOT NULL, -- 'ok' | 'error'
+error_text text,
+created_at timestamptz NOT NULL DEFAULT now()
+);
 
-@dp.message_handler(commands=["register"])
-async def cmd_register(message: types.Message):
-    await message.answer(
-        "Нажми кнопку ниже, чтобы открыть форму регистрации:",
-        reply_markup=register_kb()
-    )
 
-# ---------- Приём данных из WebApp ----------
-@dp.message_handler(content_types=types.ContentType.WEB_APP_DATA)
-async def handle_webapp(message: types.Message):
-    try:
-        raw = message.web_app_data.data or "{}"
-        data = json.loads(raw)
-        logging.info(f"WebApp data from {message.from_user.id}: {data}")
+-- Simple trigger to auto-update updated_at
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+NEW.updated_at = now();
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
-        # Сохраняем в Supabase, если включено
-        if supabase:
-            payload = {
-                "telegram_id": str(message.from_user.id),
-                "nickname": data.get("nickname"),
-                "telegram": data.get("telegram"),
-                "expectations": data.get("expectations"),
-                "play_other": data.get("play_other"),
-                "clan_life": data.get("clan_life"),
-                # Если у тебя колонка JSON/array — оставляй как есть, иначе сериализуй строкой:
-                "decks": data.get("decks"),
-            }
-            res = supabase.table("players").insert(payload).execute()
-            logging.info(f"Supabase insert result: {res}")
 
-        await message.answer("✅ Регистрация получена! Спасибо.")
-    except Exception:
-        logging.exception("Ошибка в обработчике WEB_APP_DATA")
-        await message.answer("❌ Произошла ошибка. Попробуй ещё раз позже.")
+DROP TRIGGER IF EXISTS trg_users_updated ON users;
+CREATE TRIGGER trg_users_updated BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
-# ---------- RUN ----------
-if __name__ == "__main__":
-    logging.info("Bot starting…")
-    executor.start_polling(dp, skip_updates=True)
+
+DROP TRIGGER IF EXISTS trg_chats_updated ON chats;
+CREATE TRIGGER trg_chats_updated BEFORE UPDATE ON chats
+FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
+
+
+DROP TRIGGER IF EXISTS trg_reminders_updated ON reminders;
+CREATE TRIGGER trg_reminders_updated BEFORE UPDATE ON reminders
+FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
