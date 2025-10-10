@@ -1,3 +1,4 @@
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
@@ -15,6 +16,7 @@ if not BOT_TOKEN or not PUBLIC_BASE_URL:
     raise RuntimeError("TELEGRAM_BOT_TOKEN and PUBLIC_BASE_URL must be set")
 
 app = FastAPI()
+logger = logging.getLogger("remindly")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
@@ -33,10 +35,19 @@ _tourney = TournamentScheduler(bot)
 
 @app.post(f"/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
-    return {"ok": True}
+    try:
+        data = await request.json()
+        update = Update.model_validate(data)
+        await dp.feed_update(bot, update)
+        return {"ok": True}
+    except Exception:
+        logger.exception("Webhook handler failed")
+        # Возвращаем 200, чтобы Telegram не считал это 502, пока разбираемся
+        return {"ok": True}
+
+@app.get("/")
+async def root():
+    return {"status": "up"}
 
 @app.get("/health")
 async def health():
