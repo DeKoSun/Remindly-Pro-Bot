@@ -3,7 +3,7 @@ chat_id bigint PRIMARY KEY,
 type text NOT NULL, -- 'group', 'supergroup', etc.
 title text,
 tournament_subscribed boolean NOT NULL DEFAULT false,
-tz text NOT NULL DEFAULT 'America/New_York',
+tz text NOT NULL DEFAULT 'Europe/Moscow',
 created_at timestamptz NOT NULL DEFAULT now(),
 updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -20,7 +20,7 @@ chat_id bigint NOT NULL,
 title text NOT NULL,
 schedule_kind schedule_type NOT NULL,
 payload_json jsonb NOT NULL, -- stores cron expr, datetime, or preset name
-tz text NOT NULL DEFAULT 'America/New_York',
+tz text NOT NULL DEFAULT 'Europe/Moscow',
 is_active boolean NOT NULL DEFAULT true,
 next_run_at timestamptz,
 last_fired_at timestamptz,

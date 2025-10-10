@@ -2,7 +2,7 @@ import os
 from aiogram.types import Message
 
 
-DEFAULT_TZ = os.getenv("DEFAULT_TZ", "America/New_York")
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Europe/Moscow")
 
 
 async def is_admin(message: Message) -> bool:
