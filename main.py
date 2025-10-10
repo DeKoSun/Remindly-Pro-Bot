@@ -7,7 +7,7 @@ from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command
 from aiogram.types import Update
 from aiogram.utils.chat_action import ChatActionSender
-from db import upsert_chat, set_tournament_subscription
+from db import upsert_chat, set_tournament_subscription, add_reminder, get_active_reminders, delete_reminder_by_id, set_paused
 from scheduler_core import TournamentScheduler, UniversalReminderScheduler
 from texts import HELP_TEXT
 from datetime import datetime, time
