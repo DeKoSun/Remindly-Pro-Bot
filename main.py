@@ -58,10 +58,12 @@ async def root():
 async def health():
     return {"ok": True}
 
+_tourney = TournamentScheduler(bot)
+_universal = UniversalReminderScheduler(bot)
+
 @app.on_event("startup")
 async def on_startup():
     _tourney.start()
-    _universal = UniversalReminderScheduler(bot)
     _universal.start()
 
     await bot.set_webhook(
@@ -69,17 +71,19 @@ async def on_startup():
         drop_pending_updates=True
     )
 
-    await bot.set_my_commands([
-        BotCommand(command="help", description="Показать команды"),
-        BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
-        BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
-        BotCommand(command="tourney_now", description="Прислать пробное напоминание турнира"),
-        BotCommand(command="add", description="Создать напоминание"),
-        BotCommand(command="list", description="Список напоминаний"),
-        BotCommand(command="delete", description="Удалить напоминание"),
-        BotCommand(command="pause", description="Пауза напоминания"),
-        BotCommand(command="resume", description="Возобновить напоминание"),
-    ])
+    await bot.set_my_commands(
+        [
+            BotCommand(command="help", description="Показать команды"),
+            BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
+            BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
+            BotCommand(command="tourney_now", description="Прислать пробное напоминание турнира"),
+            BotCommand(command="add", description="Создать напоминание"),
+            BotCommand(command="list", description="Список напоминаний"),
+            BotCommand(command="delete", description="Удалить напоминание"),
+            BotCommand(command="pause", description="Пауза напоминания"),
+            BotCommand(command="resume", description="Возобновить напоминание"),
+        ]
+    )
 
 # === Проверка прав администратора ===
 async def _is_admin(message: types.Message) -> bool:
