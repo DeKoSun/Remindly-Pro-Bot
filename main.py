@@ -25,11 +25,11 @@ from texts import HELP_TEXT
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    await m.answer("Бот запущен. Напишите /help, чтобы увидеть команды.")
+    await m.answer("Приветствую тебя! Напишите /help, чтобы увидеть мои команды.")
 
 @dp.message(Command("help"))
 async def cmd_help(m: types.Message):
-    await m.answer(HELP_TEXT)
+    await m.answer(HELP_TEXT, parse_mode=None, disable_web_page_preview=True)
 
 _tourney = TournamentScheduler(bot)
 
