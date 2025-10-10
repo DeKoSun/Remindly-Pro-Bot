@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import ChatJoinRequest
+from aiogram.types import Update
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.webhook.serializers.json import JSONSerializer
 from aiogram.filters import Command
@@ -31,7 +31,14 @@ dp = Dispatcher()
 # Scheduler
 _tourney = TournamentScheduler(bot)
 
-
+@app.on_event("startup")
+async def on_startup():
+    _tourney.start()
+    await bot.set_webhook(
+        url=f"{PUBLIC_BASE_URL}/{WEBHOOK_SECRET}",
+        drop_pending_updates=True
+    )
+    
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
 await m.answer("Бот готов. /help — список команд.")
