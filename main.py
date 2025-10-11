@@ -23,8 +23,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from db import (
-    # базовые
+    # базовые операции
     upsert_chat,
+    upsert_telegram_user,           # ← добавили: регистрируем пользователя
     set_tournament_subscription,
     add_reminder,
     get_active_reminders,
@@ -42,7 +43,7 @@ from db import (
     get_reminder_by_id,
     update_reminder_text,
     set_paused_by_id,
-    update_remind_at,  # <- важно для «+15 минут» и «завтра»
+    update_remind_at,               # для «+15 минут» и «завтра»
 )
 
 from scheduler_core import TournamentScheduler, UniversalReminderScheduler
@@ -58,6 +59,7 @@ if not BOT_TOKEN or not PUBLIC_BASE_URL:
 
 app = FastAPI()
 logger = logging.getLogger("remindly")
+logger.setLevel(logging.INFO)
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
@@ -68,6 +70,29 @@ TOURNEY_SLOTS = [time(14, 0), time(16, 0), time(18, 0), time(20, 0), time(22, 0)
 def _msk_now():
     import pytz
     return datetime.now(pytz.timezone(MSK_TZ))
+
+async def _ensure_user_chat(m: types.Message | types.CallbackQuery):
+    """
+    Гарантируем наличие записей в telegram_users и telegram_chats,
+    чтобы не ловить FK-ошибки при вставке в reminders.
+    """
+    if isinstance(m, types.CallbackQuery):
+        user = m.from_user
+        chat = m.message.chat
+    else:
+        user = m.from_user
+        chat = m.chat
+
+    try:
+        upsert_telegram_user(user.id)
+    except Exception as e:
+        logger.exception("upsert_telegram_user failed: %s", e)
+
+    try:
+        # для приватных чатов записывать не обязательно, но можно — FK у нас на chat_id есть
+        upsert_chat(chat_id=chat.id, type_=chat.type, title=getattr(chat, "title", None))
+    except Exception as e:
+        logger.exception("upsert_chat failed: %s", e)
 
 def _parse_when(text: str) -> datetime | None:
     """
@@ -147,10 +172,12 @@ def _reminder_kbd(rid: str, paused: bool) -> InlineKeyboardBuilder:
 # ======================= /start /help =======================
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
+    await _ensure_user_chat(m)
     await m.answer("Приветствую тебя! Напиши /help, чтобы увидеть мои команды.")
 
 @dp.message(Command("help"))
 async def cmd_help(m: types.Message):
+    await _ensure_user_chat(m)
     await m.answer(HELP_TEXT, parse_mode=None, disable_web_page_preview=True)
 
 # ======================= Планировщики =======================
@@ -187,7 +214,7 @@ async def on_startup():
         drop_pending_updates=True,
     )
 
-    # Команды для ЛИЧНЫХ чатов (вернёт «кнопочное» меню в DM)
+    # Команды для ЛИЧНЫХ чатов
     await bot.set_my_commands(
         commands=[
             BotCommand(command="help", description="Показать команды"),
@@ -204,7 +231,7 @@ async def on_startup():
         scope=BotCommandScopeAllPrivateChats(),
     )
 
-    # Команды для ГРУПП (возвращает иконку меню в группах)
+    # Команды для ГРУПП
     await bot.set_my_commands(
         commands=[
             BotCommand(command="help", description="Показать команды"),
@@ -228,6 +255,7 @@ async def on_startup():
 
 # ======================= Проверка прав ======================
 async def _is_admin(message: types.Message) -> bool:
+    await _ensure_user_chat(message)
     if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         await message.answer("Эта команда доступна только в групповых чатах.")
         return False
@@ -238,6 +266,7 @@ async def _is_admin(message: types.Message) -> bool:
     return True
 
 async def _is_editor_or_admin(message: types.Message) -> bool:
+    await _ensure_user_chat(message)
     if message.chat.type == ChatType.PRIVATE:
         return True
     member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
@@ -276,6 +305,7 @@ async def cmd_tourney_now(m: types.Message):
 
 @dp.message(Command("schedule"))
 async def cmd_schedule(m: types.Message):
+    await _ensure_user_chat(m)
     now = _msk_now()
     today = now.date()
     slots: list[tuple[datetime, datetime]] = []
@@ -308,16 +338,19 @@ class EditReminder(StatesGroup):
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(m: types.Message, state: FSMContext):
+    await _ensure_user_chat(m)
     await state.clear()
     await m.answer("Отменено.")
 
-@dp.message(Command("add"))
+@dp.message(Command("add")))
 async def add_start(message: types.Message, state: FSMContext):
+    await _ensure_user_chat(message)
     await state.set_state(AddReminder.waiting_for_text)
     await message.answer("📝 Введи текст напоминания:")
 
 @dp.message(AddReminder.waiting_for_text)
 async def add_got_text(message: types.Message, state: FSMContext):
+    await _ensure_user_chat(message)
     await state.update_data(text=message.text.strip())
     await state.set_state(AddReminder.waiting_for_time)
     await message.answer(
@@ -327,6 +360,7 @@ async def add_got_text(message: types.Message, state: FSMContext):
 
 @dp.message(AddReminder.waiting_for_time)
 async def add_got_time(message: types.Message, state: FSMContext):
+    await _ensure_user_chat(message)
     when = _parse_when(message.text)
     if not when:
         await message.answer("⚠️ Неверный формат. Примеры: 14:30 • завтра 10:00 • через 25 минут • через 2 часа")
@@ -334,11 +368,14 @@ async def add_got_time(message: types.Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
     add_reminder(message.from_user.id, message.chat.id, text, when)
+    logger.info("created reminder user=%s chat=%s when=%s text=%r",
+                message.from_user.id, message.chat.id, when.isoformat(), text)
     await state.clear()
     await message.answer(f"✅ Напоминание создано:\n<b>{text}</b>\n🕒 {when.strftime('%Y-%m-%d %H:%M')} (UTC)")
 
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
+    await _ensure_user_chat(message)
     res = get_active_reminders(message.from_user.id)
     items = res.data or []
     if not items:
@@ -353,6 +390,7 @@ async def cmd_list(message: types.Message):
 
 @dp.message(Command("delete"))
 async def cmd_delete(message: types.Message):
+    await _ensure_user_chat(message)
     parts = message.text.strip().split()
     if len(parts) < 2:
         await message.answer("Укажи id: /delete <id>")
@@ -363,6 +401,7 @@ async def cmd_delete(message: types.Message):
 
 @dp.message(Command("pause"))
 async def cmd_pause(message: types.Message):
+    await _ensure_user_chat(message)
     parts = message.text.strip().split()
     if len(parts) < 2:
         await message.answer("Укажи id: /pause <id>")
@@ -373,6 +412,7 @@ async def cmd_pause(message: types.Message):
 
 @dp.message(Command("resume"))
 async def cmd_resume(message: types.Message):
+    await _ensure_user_chat(message)
     parts = message.text.strip().split()
     if len(parts) < 2:
         await message.answer("Укажи id: /resume <id>")
@@ -384,6 +424,7 @@ async def cmd_resume(message: types.Message):
 # ===== inline-коллбэки: пауза/резюм/удалить/редактировать/перенести ===
 @dp.callback_query(lambda c: c.data and c.data.startswith("r:"))
 async def cb_router(c: CallbackQuery, state: FSMContext):
+    await _ensure_user_chat(c)
     try:
         _, action, rid = c.data.split(":", 2)
     except Exception:
@@ -472,6 +513,7 @@ async def cb_router(c: CallbackQuery, state: FSMContext):
 
 @dp.message(EditReminder.waiting_for_new_text)
 async def edit_set_text(m: types.Message, state: FSMContext):
+    await _ensure_user_chat(m)
     if m.text.strip().lower() == "/cancel":
         await state.clear()
         await m.answer("Редактирование отменено.")
@@ -497,8 +539,9 @@ async def edit_set_text(m: types.Message, state: FSMContext):
         await m.answer("✅ Текст обновлен. (карточка не найдена)")
 
 # ========= Повторяющиеся напоминания (cron) =========
-@dp.message(Command("add_repeat"))
+@dp.message(Command("add_repeat")))
 async def cmd_add_repeat(m: types.Message):
+    await _ensure_user_chat(m)
     if not await _is_editor_or_admin(m):
         await m.answer("Недостаточно прав для создания повторяющихся напоминаний.")
         return
@@ -542,11 +585,14 @@ async def cmd_add_repeat(m: types.Message):
         return
 
     add_recurring_reminder(m.from_user.id, m.chat.id, text, cron_expr)
+    logger.info("created recurring reminder user=%s chat=%s cron=%s text=%r",
+                m.from_user.id, m.chat.id, cron_expr, text)
     await m.answer(f"✅ Создал повторяющееся напоминание:\n<b>{text}</b>\nCRON: <code>{cron_expr}</code>")
 
 # ================= Таймзона и «тихие часы» =================
 @dp.message(Command("set_tz"))
 async def cmd_set_tz(m: types.Message):
+    await _ensure_user_chat(m)
     parts = m.text.strip().split()
     if len(parts) < 2:
         await m.answer("Укажи таймзону, например: /set_tz Europe/Moscow")
@@ -556,6 +602,7 @@ async def cmd_set_tz(m: types.Message):
 
 @dp.message(Command("quiet"))
 async def cmd_quiet(m: types.Message):
+    await _ensure_user_chat(m)
     parts = m.text.strip().split()
     if len(parts) < 2:
         await m.answer("Формат: /quiet HH-HH  или /quiet off")
@@ -575,6 +622,7 @@ async def cmd_quiet(m: types.Message):
 # ======================= Роли в чате =======================
 @dp.message(Command("role"))
 async def cmd_role(m: types.Message):
+    await _ensure_user_chat(m)
     # /role list
     # /role grant <user_id> editor
     # /role revoke <user_id>
