@@ -20,6 +20,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # Прямое подключение к Postgres того же кластера (удобно для транзакций/проверок)
+# Для Supabase чаще всего используем URI «Transaction pooler» (порт 6543, sslmode=require).
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
@@ -88,7 +89,8 @@ def ensure_parent_rows(user_id: int | None, chat_id: int | None):
 # ========= ЧАТЫ / ПОДПИСКИ НА ТУРНИРЫ =========
 
 def upsert_chat(chat_id: int, type_: str, title: str | None):
-    upsert_telegram_chat(chat_id)  # чтобы FK точно не мешал
+    # FK на chat_id
+    upsert_telegram_chat(chat_id)
 
     if _table_exists("telegram_chats"):
         with get_conn() as c:
@@ -103,7 +105,7 @@ def upsert_chat(chat_id: int, type_: str, title: str | None):
             )
             c.commit()
     else:
-        # старый вариант схемы (если таблицы telegram_chats нет)
+        # совместимость со старой схемой
         with get_conn() as c:
             cur = c.cursor()
             cur.execute(
