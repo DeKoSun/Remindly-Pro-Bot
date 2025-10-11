@@ -19,8 +19,8 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 # HTTP-клиент к таблицам Supabase (сервисный ключ обходит RLS)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Прямое подключение к Postgres того же кластера (удобно для транзакций/проверок)
-# Для Supabase чаще всего используем URI «Transaction pooler» (порт 6543, sslmode=require).
+# Прямое подключение к Postgres того же кластера (для транзакций/проверок).
+# Для Supabase обычно используют URI “Transaction pooler” (порт 6543, sslmode=require).
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
@@ -47,12 +47,15 @@ def _iso(dt: datetime) -> str:
 def _table_exists(name: str) -> bool:
     with get_conn() as c:
         cur = c.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             select 1
             from information_schema.tables
             where table_schema = 'public' and table_name = %s
             limit 1
-        """, (name,))
+            """,
+            (name,),
+        )
         return cur.fetchone() is not None
 
 
@@ -105,7 +108,7 @@ def upsert_chat(chat_id: int, type_: str, title: str | None):
             )
             c.commit()
     else:
-        # совместимость со старой схемой
+        # Совместимость со старой схемой
         with get_conn() as c:
             cur = c.cursor()
             cur.execute(
@@ -204,8 +207,8 @@ def get_active_reminders(user_id: int):
         .select("*")
         .eq("user_id", user_id)
         .eq("paused", False)
-        .order("remind_at", nullsfirst=True)   # <-- исправлено
-        .order("next_at", nullsfirst=True)     # <-- исправлено
+        .order("remind_at", nullsfirst=True)   # FIX: корректный параметр сортировки
+        .order("next_at", nullsfirst=True)     # FIX: корректный параметр сортировки
         .execute()
     )
 
