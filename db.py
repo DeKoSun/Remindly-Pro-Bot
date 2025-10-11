@@ -1,7 +1,8 @@
 # FILE: db.py
 import os
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
 import psycopg2
 import psycopg2.extras
 from supabase import create_client
@@ -29,37 +30,68 @@ def get_conn():
         conn.close()
 
 # ============================================================
-# ЧАТЫ И ПОДПИСКИ НА ТУРНИРЫ
-# Поддержка новой схемы (telegram_chats / tournament_subscribers)
-# и fallback на старую (chats).
+# УТИЛИТЫ
 # ============================================================
+
+def _iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 def _table_exists(table_name: str) -> bool:
     with get_conn() as c:
         cur = c.cursor()
         cur.execute("""
-            select 1 from information_schema.tables
-            where table_schema='public' and table_name=%s
+            select 1
+            from information_schema.tables
+            where table_schema = 'public' and table_name = %s
             limit 1
         """, (table_name,))
         return cur.fetchone() is not None
 
+# Родительские строки для FK: telegram_users / telegram_chats
+def upsert_telegram_user(user_id: int):
+    if not _table_exists("telegram_users"):
+        return
+    # сохраняем только ключ и created_at
+    supabase.table("telegram_users").upsert(
+        {"user_id": user_id, "created_at": _iso(datetime.now(timezone.utc))}
+    ).execute()
+
+def upsert_telegram_chat(chat_id: int):
+    if not _table_exists("telegram_chats"):
+        return
+    supabase.table("telegram_chats").upsert(
+        {"chat_id": chat_id, "created_at": _iso(datetime.now(timezone.utc))}
+    ).execute()
+
+def ensure_parent_rows(user_id: int | None, chat_id: int | None):
+    if user_id is not None:
+        upsert_telegram_user(user_id)
+    if chat_id is not None:
+        upsert_telegram_chat(chat_id)
+
+# ============================================================
+# ЧАТЫ И ПОДПИСКИ НА ТУРНИРЫ
+# ============================================================
+
 def upsert_chat(chat_id: int, type_: str, title: str | None):
+    # фиксируем родителя для FK, если таблица есть
+    upsert_telegram_chat(chat_id)
+
     if _table_exists("telegram_chats"):
         with get_conn() as c:
             cur = c.cursor()
             cur.execute(
                 """
-                insert into telegram_chats(chat_id, type, title)
-                values (%s, %s, %s)
-                on conflict (chat_id) do update
-                set title = excluded.title
+                insert into telegram_chats(chat_id, type, title, created_at)
+                values (%s, %s, %s, now())
+                on conflict (chat_id) do update set title = excluded.title
                 """,
                 (chat_id, type_, title),
             )
             c.commit()
     else:
-        # старый вариант
         with get_conn() as c:
             cur = c.cursor()
             cur.execute(
@@ -67,45 +99,44 @@ def upsert_chat(chat_id: int, type_: str, title: str | None):
                 insert into chats(chat_id, type, title)
                 values (%s, %s, %s)
                 on conflict (chat_id) do update
-                set title = excluded.title, updated_at = now()
+                  set title = excluded.title, updated_at = now()
                 """,
                 (chat_id, type_, title),
             )
             c.commit()
 
 def set_tournament_subscription(chat_id: int, value: bool, user_id: int | None = None):
-    """
-    Новый вариант: public.tournament_subscribers(user_id, chat_id).
-    Если таблицы нет —fallback в старую колонку chats.tournament_subscribed.
-    """
+    # тоже гарантируем родителей
+    if user_id is not None:
+        upsert_telegram_user(user_id)
+    upsert_telegram_chat(chat_id)
+
     if _table_exists("tournament_subscribers"):
         if user_id is None:
-            # если не передали — сохраняем заглушку для совместимости
+            # если не знаем автора — сохраняем 0 (допустимо для нашей схемы)
             user_id = 0
         if value:
             supabase.table("tournament_subscribers").upsert({
                 "user_id": user_id,
                 "chat_id": chat_id,
+                "subscribed_at": _iso(datetime.now(timezone.utc)),
             }).execute()
         else:
-            supabase.table("tournament_subscribers").delete().eq("chat_id", chat_id).eq("user_id", user_id).execute()
+            supabase.table("tournament_subscribers") \
+                .delete().eq("chat_id", chat_id).eq("user_id", user_id).execute()
     else:
         with get_conn() as c:
             cur = c.cursor()
             cur.execute(
-                "update chats set tournament_subscribed=%s, updated_at=now() where chat_id=%s",
+                "update chats set tournament_subscribed = %s, updated_at = now() where chat_id = %s",
                 (value, chat_id),
             )
             c.commit()
 
 def get_tournament_subscribed_chats():
     if _table_exists("tournament_subscribers"):
-        rows = (
-            supabase.table("tournament_subscribers")
-            .select("chat_id")
-            .execute().data or []
-        )
-        # возвращаем в формате [(chat_id, tz_name), ...]; tz не ведём здесь → None
+        rows = supabase.table("tournament_subscribers").select("chat_id").execute().data or []
+        # возвращаем [(chat_id, tz_name)] — tz здесь не ведём
         return [(r["chat_id"], None) for r in rows]
     else:
         with get_conn() as c:
@@ -114,32 +145,32 @@ def get_tournament_subscribed_chats():
             return cur.fetchall()
 
 # ============================================================
-# УНИВЕРСАЛЬНЫЕ НАПОМИНАНИЯ (таблица public.reminders)
-#   id uuid PK, user_id bigint, chat_id bigint, text text,
-#   remind_at timestamptz, paused bool,
-#   kind text ('once'|'cron'), cron_expr text, next_at timestamptz,
-#   created_by bigint, created_at timestamptz default now()
+# УНИВЕРСАЛЬНЫЕ НАПОМИНАНИЯ (public.reminders)
+#   id uuid PK, user_id bigint (FK telegram_users.user_id),
+#   chat_id bigint (FK telegram_chats.chat_id),
+#   text text, kind text ('once'|'cron'),
+#   remind_at timestamptz, cron_expr text, next_at timestamptz,
+#   paused bool, created_by bigint, created_at timestamptz default now(),
+#   updated_at timestamptz null
 # ============================================================
 
-def _iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
-
 def add_reminder(user_id: int, chat_id: int, text: str, remind_at: datetime):
-    """Одноразовое напоминание (kind='once')."""
+    """Одноразовое напоминание."""
+    ensure_parent_rows(user_id, chat_id)
     return supabase.table("reminders").insert({
         "user_id": user_id,
         "chat_id": chat_id,
         "text": text,
+        "kind": "once",
         "remind_at": _iso(remind_at),
         "paused": False,
-        "kind": "once",
         "created_by": user_id,
+        "created_at": _iso(datetime.now(timezone.utc)),
     }).execute()
 
 def add_recurring_reminder(user_id: int, chat_id: int, text: str, cron_expr: str):
-    """Повторяющееся (kind='cron'): рассчитываем next_at от текущего момента UTC."""
+    """Повторяющееся напоминание (cron)."""
+    ensure_parent_rows(user_id, chat_id)
     now = datetime.now(timezone.utc)
     next_at = croniter(cron_expr, now).get_next(datetime)
     return supabase.table("reminders").insert({
@@ -151,6 +182,7 @@ def add_recurring_reminder(user_id: int, chat_id: int, text: str, cron_expr: str
         "next_at": _iso(next_at),
         "paused": False,
         "created_by": user_id,
+        "created_at": _iso(now),
     }).execute()
 
 def get_active_reminders(user_id: int):
@@ -200,7 +232,7 @@ def update_remind_at(reminder_id: str, when_utc_dt: datetime):
 def get_due_once_and_recurring(window_minutes: int = 10):
     """
     Возвращает (once_list, cron_list) для доставки за последние window_minutes.
-    Это даёт «окно догонки», если процесс спал/рестартовал.
+    Даёт «окно догонки», если процесс спал/рестартовал.
     """
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(minutes=window_minutes)
@@ -239,6 +271,7 @@ def advance_recurring(reminder_id: str, cron_expr: str):
 # ============================================================
 
 def set_user_tz(user_id: int, tz_name: str):
+    upsert_telegram_user(user_id)
     return supabase.table("user_prefs").upsert({
         "user_id": user_id,
         "tz_name": tz_name,
@@ -246,6 +279,7 @@ def set_user_tz(user_id: int, tz_name: str):
     }).execute()
 
 def set_quiet_hours(user_id: int, quiet_from: int | None, quiet_to: int | None):
+    upsert_telegram_user(user_id)
     return supabase.table("user_prefs").upsert({
         "user_id": user_id,
         "quiet_from": quiet_from,
@@ -262,6 +296,7 @@ def get_user_prefs(user_id: int):
 # ============================================================
 
 def grant_role(chat_id: int, user_id: int, role: str):
+    ensure_parent_rows(user_id, chat_id)
     return supabase.table("chat_roles").upsert({
         "chat_id": chat_id,
         "user_id": user_id,
