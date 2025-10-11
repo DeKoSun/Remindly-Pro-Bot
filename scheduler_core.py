@@ -45,6 +45,11 @@ START_DISPLAY_MAP = {
 
 
 class TournamentScheduler:
+    """
+    Планировщик «турнирных» уведомлений по фиксированным MSK-временным слотам
+    для всех чатов, подписанных в БД.
+    """
+
     def __init__(self, bot: Bot):
         self.bot = bot
         self.scheduler = AsyncIOScheduler(
@@ -56,12 +61,11 @@ class TournamentScheduler:
 
     def start(self) -> None:
         self.scheduler.start()
-        # периодическая сверка подписанных чатов (чтобы подхватывать новые)
+        # Переустанавливаем задания раз в 5 минут и сразу при старте
         self.scheduler.add_job(
             self._ensure_tournament_jobs,
             CronTrigger.from_crontab("*/5 * * * *", timezone=self.scheduler.timezone),
         )
-        # первичная регистрация сразу
         self.scheduler.add_job(
             self._ensure_tournament_jobs,
             next_run_time=datetime.now(self.scheduler.timezone),
@@ -90,7 +94,7 @@ class TournamentScheduler:
     def _ensure_tournament_jobs(self) -> None:
         rows = get_tournament_subscribed_chats()
         for r in rows:
-            # ожидаем, что SELECT chat_id, tz FROM chats ...
+            # ожидаем SELECT chat_id, tz FROM chats ...
             chat_id = r[0]
             tz_name = r[1] if len(r) > 1 else None
             self._register_daily_jobs_for_chat(chat_id, tz_name)
@@ -143,16 +147,22 @@ class UniversalReminderScheduler:
         if not kind or kind == "once":
             return None
 
-        # Базово считаем в UTC (в будущем можно добавить персональные таймзоны)
+        # cron-режим
         if kind == "repeat_cron":
             try:
-                it = croniter(cron_expr, now_utc)
-                return it.get_next(datetime)
+                it = croniter(cron_expr, now_utc + timedelta(seconds=1))
+                nxt = it.get_next(datetime)
+                # приводим к UTC «на всякий»
+                if nxt.tzinfo is None:
+                    nxt = nxt.replace(tzinfo=timezone.utc)
+                else:
+                    nxt = nxt.astimezone(timezone.utc)
+                return nxt
             except Exception:
                 logger.warning("Bad cron_expr for reminder id=%s: %r", r.get("id"), cron_expr)
                 return None
 
-        # Все остальные — HH:MM
+        # Ежедневно/по будням/по выходным — как HH:MM (UTC)
         hhmm = self._parse_hhmm(cron_expr)
         if not hhmm:
             logger.warning("Bad HH:MM for reminder id=%s kind=%s expr=%r", r.get("id"), kind, cron_expr)
@@ -214,7 +224,7 @@ class UniversalReminderScheduler:
                 except Exception as e:
                     logger.exception("Failed to send reminder id=%s chat_id=%s: %s", rid, chat_id, e)
 
-                # Пост-обработка
+                # Пост-обработка: удалить once или сдвинуть next_at для повторов
                 try:
                     with get_conn() as c2:
                         cur2 = c2.cursor()
@@ -233,8 +243,11 @@ class UniversalReminderScheduler:
                             }
                             nxt = self._calc_next_for_kind(r_dict, now_utc)
                             if nxt is None:
-                                # предохранитель: не зацикливаем
-                                cur2.execute("UPDATE reminders SET next_at = NULL WHERE id = %s", (rid,))
+                                # предохранитель: не зацикливаем и не спамим
+                                cur2.execute(
+                                    "UPDATE reminders SET next_at = NULL, paused = true WHERE id = %s",
+                                    (rid,),
+                                )
                             else:
                                 cur2.execute("UPDATE reminders SET next_at = %s WHERE id = %s", (nxt, rid))
                         c2.commit()
