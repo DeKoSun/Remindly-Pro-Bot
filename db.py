@@ -19,8 +19,8 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 # HTTP-клиент к таблицам Supabase (сервисный ключ обходит RLS)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Прямое подключение к Postgres того же кластера (для транзакций/проверок).
-# Для Supabase обычно используют URI “Transaction pooler” (порт 6543, sslmode=require).
+# Прямое подключение к Postgres того же кластера (для транзакций/миграций).
+# Для Supabase используйте URI “Transaction pooler” (порт 6543, sslmode=require).
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
@@ -92,23 +92,16 @@ def ensure_parent_rows(user_id: int | None, chat_id: int | None):
 # ========= ЧАТЫ / ПОДПИСКИ НА ТУРНИРЫ =========
 
 def upsert_chat(chat_id: int, type_: str, title: str | None):
-    # FK на chat_id
+    """
+    Совместим с двумя схемами:
+    - новая: telegram_chats (минимум chat_id, created_at) — просто гарантируем наличие строки;
+    - старая: таблица chats с полями type/title.
+    """
+    # новая схема — просто гарантируем FK
     upsert_telegram_chat(chat_id)
 
-    if _table_exists("telegram_chats"):
-        with get_conn() as c:
-            cur = c.cursor()
-            cur.execute(
-                """
-                insert into telegram_chats(chat_id, type, title, created_at)
-                values (%s, %s, %s, now())
-                on conflict (chat_id) do update set title = excluded.title
-                """,
-                (chat_id, type_, title),
-            )
-            c.commit()
-    else:
-        # Совместимость со старой схемой
+    # старая схема (если есть)
+    if _table_exists("chats"):
         with get_conn() as c:
             cur = c.cursor()
             cur.execute(
@@ -140,7 +133,8 @@ def set_tournament_subscription(chat_id: int, value: bool, user_id: int | None =
         else:
             supabase.table("tournament_subscribers") \
                 .delete().eq("chat_id", chat_id).eq("user_id", user_id).execute()
-    else:
+    elif _table_exists("chats"):
+        # бэкап для старой схемы
         with get_conn() as c:
             cur = c.cursor()
             cur.execute(
@@ -154,11 +148,13 @@ def get_tournament_subscribed_chats():
     if _table_exists("tournament_subscribers"):
         rows = supabase.table("tournament_subscribers").select("chat_id").execute().data or []
         return [(r["chat_id"], None) for r in rows]  # (chat_id, tz)
-    else:
+    elif _table_exists("chats"):
         with get_conn() as c:
             cur = c.cursor(cursor_factory=psycopg2.extras.DictCursor)
             cur.execute("select chat_id, tz from chats where tournament_subscribed = true")
             return cur.fetchall()
+    else:
+        return []
 
 
 # ========= УНИВЕРСАЛЬНЫЕ НАПОМИНАНИЯ (public.reminders) =========
@@ -202,13 +198,17 @@ def add_recurring_reminder(user_id: int, chat_id: int, text: str, cron_expr: str
 
 
 def get_active_reminders(user_id: int):
+    """
+    Вернёт активные напоминания пользователя.
+    Важно: в supabase-py параметр сортировки — `nullsfirst=True`, а не `nulls_first`.
+    """
     return (
         supabase.table("reminders")
         .select("*")
         .eq("user_id", user_id)
         .eq("paused", False)
-        .order("remind_at", nullsfirst=True)   # FIX: корректный параметр сортировки
-        .order("next_at", nullsfirst=True)     # FIX: корректный параметр сортировки
+        .order("remind_at", nullsfirst=True)   # FIX
+        .order("next_at", nullsfirst=True)     # FIX
         .execute()
     )
 
@@ -255,6 +255,7 @@ def update_remind_at(reminder_id: str, when_utc_dt: datetime):
 def get_due_once_and_recurring(window_minutes: int = 10):
     """
     Возвращает (once_list, cron_list) для окна догонки window_minutes.
+    Важно: сравнения по ISO-строкам в UTC (RLS безопасно, сервисный ключ).
     """
     now = datetime.now(timezone.utc)
     win = now - timedelta(minutes=window_minutes)
@@ -349,7 +350,7 @@ def dbg_insert_once(user_id: int, chat_id: int, minutes: int = 1, text: str | No
     Форсируем вставку «одноразового» напоминания через N минут.
     1) гарантируем родительские строки под FK,
     2) пишем в public.reminders.
-    Возвращает dict с inserted row (как отдаёт Supabase Python).
+    Возвращает dict вставленной строки.
     """
     ensure_parent_rows(user_id, chat_id)
     when = datetime.now(timezone.utc) + timedelta(minutes=minutes)

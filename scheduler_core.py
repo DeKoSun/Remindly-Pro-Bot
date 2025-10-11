@@ -109,6 +109,7 @@ class UniversalReminderScheduler:
     Фоновый поллер БД: берёт «просроченные» одноразовые/повторяющиеся напоминания
     и отправляет сообщения. Для повторяющихся рассчитывает следующее next_at.
     """
+
     def __init__(self, bot: Bot, poll_interval_sec: int = 30):
         self.bot = bot
         self.poll_interval_sec = max(5, poll_interval_sec)
@@ -137,7 +138,7 @@ class UniversalReminderScheduler:
         """
         Возвращает следующий момент (UTC) для повторяющегося напоминания.
         Ожидаемые значения:
-          kind: repeat_daily / repeat_weekdays / repeat_weekend / repeat_cron
+          kind: repeat_daily / repeat_weekdays / repeat_weekend / repeat_cron / cron
           cron_expr: для daily/… ожидаем 'HH:MM', для cron — стандартный cron.
         """
         kind = (r.get("kind") or "").strip().lower()
@@ -147,12 +148,12 @@ class UniversalReminderScheduler:
         if not kind or kind == "once":
             return None
 
-        # cron-режим
-        if kind == "repeat_cron":
+        # cron-режим (поддерживаем и 'repeat_cron', и исторический 'cron')
+        if kind in ("repeat_cron", "cron"):
             try:
                 it = croniter(cron_expr, now_utc + timedelta(seconds=1))
                 nxt = it.get_next(datetime)
-                # приводим к UTC «на всякий»
+                # приводим к UTC
                 if nxt.tzinfo is None:
                     nxt = nxt.replace(tzinfo=timezone.utc)
                 else:
@@ -191,13 +192,57 @@ class UniversalReminderScheduler:
         # неизвестный тип — не зацикливаем
         return None
 
+    def _backfill_next_at_for_active_repeats(self, now_utc: datetime):
+        """
+        Подстраховка: для активных повторных напоминаний с NULL next_at —
+        проставляем ближайшее будущее значение next_at (чтобы они «завелись»).
+        """
+        with get_conn() as c:
+            cur = c.cursor()
+            cur.execute(
+                """
+                SELECT id, kind, cron_expr, remind_at, next_at
+                FROM reminders
+                WHERE paused = false
+                  AND kind IS NOT NULL
+                  AND lower(kind) <> 'once'
+                  AND next_at IS NULL
+                LIMIT 100
+                """
+            )
+            to_fix = cur.fetchall()
+
+        if not to_fix:
+            return
+
+        for rid, kind, cron_expr, remind_at, next_at in to_fix:
+            r_dict = {
+                "id": rid,
+                "kind": (kind or "").strip().lower(),
+                "cron_expr": cron_expr,
+                "remind_at": remind_at,
+                "next_at": next_at,
+            }
+            nxt = self._calc_next_for_kind(r_dict, now_utc)
+            if nxt:
+                try:
+                    with get_conn() as c2:
+                        cur2 = c2.cursor()
+                        cur2.execute("UPDATE reminders SET next_at = %s WHERE id = %s", (nxt, rid))
+                        c2.commit()
+                except Exception:
+                    logger.exception("Failed to backfill next_at for reminder id=%s", rid)
+
     # ---------- main loop ----------
 
     async def _check_reminders(self):
         while True:
             now_utc = datetime.now(timezone.utc)
 
-            # Берём due-напоминания (одноразовые: remind_at, повторяющиеся: next_at)
+            # 1) Проставим next_at там, где он пустой у повторов
+            self._backfill_next_at_for_active_repeats(now_utc)
+
+            # 2) Забираем due-напоминания
             with get_conn() as c:
                 cur = c.cursor()
                 cur.execute(
@@ -213,18 +258,18 @@ class UniversalReminderScheduler:
                 )
                 rows = cur.fetchall()
 
-            # Отправляем
+            # 3) Отправляем пользователю
             for row in rows:
                 # row как tuple (с psycopg2 без DictCursor); индексы строго по SELECT
                 rid, chat_id, text, kind, cron_expr, remind_at, next_at = row
                 try:
-                    # В сообщении — только человеческий текст
+                    # В сообщении — только человекочитаемый текст
                     await self.bot.send_message(chat_id, f"⏰ Напоминание: <b>{text}</b>")
                     logger.info("sent reminder id=%s chat_id=%s", rid, chat_id)
                 except Exception as e:
                     logger.exception("Failed to send reminder id=%s chat_id=%s: %s", rid, chat_id, e)
 
-                # Пост-обработка: удалить once или сдвинуть next_at для повторов
+                # 4) Пост-обработка: удалить once или сдвинуть next_at для повторов
                 try:
                     with get_conn() as c2:
                         cur2 = c2.cursor()
