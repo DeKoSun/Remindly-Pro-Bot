@@ -8,10 +8,11 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command
-from aiogram.types import Update, BotCommand
+from aiogram.types import Update, BotCommand, CallbackQuery
 from aiogram.utils.chat_action import ChatActionSender
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# FSM для мастера /add
+# FSM
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -22,7 +23,7 @@ from db import (
     get_active_reminders,
     delete_reminder_by_id,
     set_paused,
-    # новое:
+    # расширения:
     add_recurring_reminder,
     set_user_tz,
     set_quiet_hours,
@@ -30,7 +31,13 @@ from db import (
     grant_role,
     revoke_role,
     list_roles,
+    # для inline-кнопок:
+    get_reminder_by_id,
+    update_reminder_text,
+    set_paused_by_id,
+    update_remind_at,
 )
+
 from scheduler_core import TournamentScheduler, UniversalReminderScheduler
 from texts import HELP_TEXT
 
@@ -57,8 +64,8 @@ def _msk_now():
 
 def _parse_when(text: str) -> datetime | None:
     """
-    Парсим простые фразы:
-      - HH:MM (если время уже прошло — на завтра)
+    Поддерживаем:
+      - HH:MM (сегодня/завтра)
       - завтра HH:MM
       - через N минут / через N часов
     Возвращаем UTC datetime.
@@ -102,6 +109,33 @@ def _parse_when(text: str) -> datetime | None:
         return dt
 
     return None
+
+# ======= Представление карточки + клавиатура для inline-кнопок =======
+def _reminder_card_text(r: dict) -> str:
+    rid = str(r["id"])[:8]
+    when = r.get("remind_at") or r.get("next_at") or "—"
+    kind = r.get("kind", "once")
+    paused = "⏸️" if r.get("paused") else "▶️"
+    return (
+        f"<b>{r['text']}</b>\n"
+        f"ID: <code>{rid}</code>  |  {paused}  |  вид: {kind}\n"
+        f"Когда: <code>{when}</code>"
+    )
+
+def _reminder_kbd(rid: str, paused: bool) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    if paused:
+        kb.button(text="▶️ Возобновить", callback_data=f"r:resume:{rid}")
+    else:
+        kb.button(text="⏸ Пауза", callback_data=f"r:pause:{rid}")
+    kb.button(text="✏️ Редактировать", callback_data=f"r:edit:{rid}")
+    kb.adjust(2)
+    kb.button(text="🔄 +15 мин", callback_data=f"r:shift15:{rid}")
+    kb.button(text="📅 Завтра (в это время)", callback_data=f"r:tomorrow:{rid}")
+    kb.adjust(2)
+    kb.button(text="🗑 Удалить", callback_data=f"r:del:{rid}")
+    kb.adjust(2, 1)
+    return kb
 
 # ======================= Команды /start /help =======================
 @dp.message(Command("start"))
@@ -154,15 +188,15 @@ async def on_startup():
             BotCommand(command="tourney_now", description="Прислать пробное напоминание турнира"),
             BotCommand(command="schedule", description="Показать ближайшие турниры"),
             BotCommand(command="add", description="Создать напоминание"),
-            BotCommand(command="list", description="Список напоминаний"),
+            BotCommand(command="list", description="Список напоминаний (с кнопками)"),
             BotCommand(command="delete", description="Удалить напоминание"),
             BotCommand(command="pause", description="Пауза напоминания"),
             BotCommand(command="resume", description="Возобновить напоминание"),
-            # новые:
             BotCommand(command="add_repeat", description="Повторяющееся напоминание"),
             BotCommand(command="set_tz", description="Установить таймзону"),
             BotCommand(command="quiet", description="Тихие часы"),
             BotCommand(command="role", description="Роли в чате"),
+            BotCommand(command="cancel", description="Отменить ввод"),
         ]
     )
 
@@ -178,10 +212,8 @@ async def _is_admin(message: types.Message) -> bool:
     return True
 
 async def _is_editor_or_admin(message: types.Message) -> bool:
-    # в личке — всегда ок
     if message.chat.type == ChatType.PRIVATE:
         return True
-    # в группе: админ телеги или редактор из нашей таблицы
     member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
     if member.is_chat_admin() or member.is_chat_creator():
         return True
@@ -245,6 +277,14 @@ class AddReminder(StatesGroup):
     waiting_for_text = State()
     waiting_for_time = State()
 
+class EditReminder(StatesGroup):
+    waiting_for_new_text = State()
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(m: types.Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Отменено.")
+
 @dp.message(Command("add"))
 async def add_start(message: types.Message, state: FSMContext):
     await state.set_state(AddReminder.waiting_for_text)
@@ -278,14 +318,12 @@ async def cmd_list(message: types.Message):
     if not items:
         await message.answer("Пока нет активных напоминаний.")
         return
-    lines = ["📋 Твои напоминания:"]
     for r in items:
-        rid = str(r["id"])[:8]
-        when = r.get("remind_at") or r.get("next_at") or "—"
-        kind = r.get("kind", "once")
-        paused = "⏸️" if r.get("paused") else "▶️"
-        lines.append(f"• <code>{rid}</code> [{paused}] ({kind}) — {r['text']} — {when}")
-    await message.answer("\n".join(lines))
+        rid = str(r["id"])
+        await message.answer(
+            _reminder_card_text(r),
+            reply_markup=_reminder_kbd(rid, bool(r.get("paused"))).as_markup(),
+        )
 
 @dp.message(Command("delete"))
 async def cmd_delete(message: types.Message):
@@ -317,6 +355,124 @@ async def cmd_resume(message: types.Message):
     set_paused(rid, False)
     await message.answer(f"▶️ Возобновил напоминание <code>{rid}</code>")
 
+# ===== inline-коллбэки: Пауза/Возобновить/Удалить/Редактировать =====
+@dp.callback_query(lambda c: c.data and c.data.startswith("r:"))
+async def cb_router(c: CallbackQuery, state: FSMContext):
+    try:
+        _, action, rid = c.data.split(":", 2)
+    except Exception:
+        await c.answer("Некорректные данные.", show_alert=True)
+        return
+
+    r = get_reminder_by_id(rid)
+    if not r:
+        await c.answer("Напоминание не найдено (возможно, уже удалено).", show_alert=True)
+        try:
+            await c.message.delete()
+        except Exception:
+            pass
+        return
+
+    if action == "pause":
+        set_paused_by_id(rid, True)
+        r["paused"] = True
+        await c.message.edit_text(_reminder_card_text(r), reply_markup=_reminder_kbd(rid, True).as_markup())
+        await c.answer("Поставлено на паузу.")
+        return
+
+    if action == "resume":
+        set_paused_by_id(rid, False)
+        r["paused"] = False
+        await c.message.edit_text(_reminder_card_text(r), reply_markup=_reminder_kbd(rid, False).as_markup())
+        await c.answer("Возобновлено.")
+        return
+
+    if action == "del":
+        delete_reminder_by_id(rid)
+        await c.message.edit_text("🗑 Напоминание удалено.")
+        await c.answer("Удалено.")
+        return
+
+    if action == "edit":
+        await state.update_data(edit_rid=rid)
+        await state.set_state(EditReminder.waiting_for_new_text)
+        await c.answer()
+        await c.message.reply("✏️ Введи новый текст для напоминания (или /cancel):")
+        return
+
+    if action == "shift15":
+        # только для разовых (kind == 'once' или отсутствует)
+        if r.get("kind") not in (None, "once"):
+            await c.answer("Это действие доступно только для разовых напоминаний.", show_alert=True)
+            return
+        ra = r.get("remind_at")
+        if not ra:
+            await c.answer("Не удалось определить время напоминания.", show_alert=True)
+            return
+        # парсим ISO; учитываем возможную 'Z'
+        try:
+            ra_dt = datetime.fromisoformat(ra.replace("Z", "+00:00"))
+        except Exception:
+            await c.answer("Неверный формат времени напоминания.", show_alert=True)
+            return
+        new_dt = ra_dt + timedelta(minutes=15)
+        update_remind_at(rid, new_dt.astimezone(timezone.utc))
+        r["remind_at"] = new_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        r["paused"] = False
+        await c.message.edit_text(_reminder_card_text(r), reply_markup=_reminder_kbd(rid, False).as_markup())
+        await c.answer("Перенесено на +15 минут.")
+        return
+
+    if action == "tomorrow":
+        # только для разовых
+        if r.get("kind") not in (None, "once"):
+            await c.answer("Это действие доступно только для разовых напоминаний.", show_alert=True)
+            return
+        ra = r.get("remind_at")
+        if not ra:
+            await c.answer("Не удалось определить время напоминания.", show_alert=True)
+            return
+        try:
+            ra_dt = datetime.fromisoformat(ra.replace("Z", "+00:00"))
+        except Exception:
+            await c.answer("Неверный формат времени напоминания.", show_alert=True)
+            return
+        new_dt = ra_dt + timedelta(days=1)  # «завтра в это же время» (UTC)
+        update_remind_at(rid, new_dt.astimezone(timezone.utc))
+        r["remind_at"] = new_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        r["paused"] = False
+        await c.message.edit_text(_reminder_card_text(r), reply_markup=_reminder_kbd(rid, False).as_markup())
+        await c.answer("Перенесено на завтра.")
+        return
+
+    await c.answer("Неизвестное действие.", show_alert=True)
+
+@dp.message(EditReminder.waiting_for_new_text)
+async def edit_set_text(m: types.Message, state: FSMContext):
+    if m.text.strip().lower() == "/cancel":
+        await state.clear()
+        await m.answer("Редактирование отменено.")
+        return
+    data = await state.get_data()
+    rid = data.get("edit_rid")
+    if not rid:
+        await state.clear()
+        await m.answer("Что-то пошло не так. Попробуй ещё раз: /list → ✏️ Редактировать.")
+        return
+    new_text = m.text.strip()
+    update_reminder_text(rid, new_text)
+    await state.clear()
+
+    r = get_reminder_by_id(rid)
+    if r:
+        await m.answer("✅ Текст обновлен.")
+        await m.answer(
+            _reminder_card_text(r),
+            reply_markup=_reminder_kbd(rid, bool(r.get("paused"))).as_markup(),
+        )
+    else:
+        await m.answer("✅ Текст обновлен. (карточка не найдена)")
+
 # ======================= Повторяющиеся напоминания ===================
 @dp.message(Command("add_repeat"))
 async def cmd_add_repeat(m: types.Message):
@@ -339,7 +495,6 @@ async def cmd_add_repeat(m: types.Message):
 
     mode = parts[1].lower()
     if mode == "cron":
-        # /add_repeat cron "*/15 * * * *" Текст...
         cron_expr = parts[2].strip('"').strip("'")
         text = " ".join(parts[3:]).strip()
     else:
@@ -413,7 +568,6 @@ async def cmd_role(m: types.Message):
         return
 
     if len(parts) >= 3 and parts[1].lower() in ("grant", "revoke"):
-        # только телеграм-админ может управлять ролями
         if not await _is_admin(m):
             return
         try:

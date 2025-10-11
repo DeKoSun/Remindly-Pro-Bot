@@ -221,6 +221,15 @@ def get_user_prefs(user_id: int):
     res = supabase.table("user_prefs").select("*").eq("user_id", user_id).single().execute()
     return res.data or {}
 
+def update_remind_at(reminder_id: str, when_utc_dt):
+    # when_utc_dt: datetime (UTC)
+    supabase.table("reminders").update({
+        "remind_at": when_utc_dt.replace(tzinfo=None).isoformat() + "Z",  # ISO с Z
+        "paused": False,  # на всякий случай снимаем паузу
+        "updated_at": "now()"
+    }).eq("id", reminder_id).execute()
+
+
 # ============================================================
 # РОЛИ В ЧАТАХ (editor/viewer) — для тонкой настройки прав
 # Таблица public.chat_roles(chat_id, user_id, role)
@@ -244,3 +253,15 @@ def has_editor_role(chat_id: int, user_id: int) -> bool:
 def list_roles(chat_id: int):
     res = supabase.table("chat_roles").select("*").eq("chat_id", chat_id).execute()
     return res.data or []
+
+def get_reminder_by_id(reminder_id: str):
+    """Вернёт одну запись напоминания (dict) по id или None."""
+    res = supabase.table("reminders").select("*").eq("id", reminder_id).limit(1).execute()
+    arr = res.data or []
+    return arr[0] if arr else None
+
+def update_reminder_text(reminder_id: str, new_text: str):
+    supabase.table("reminders").update({"text": new_text, "updated_at": "now()"}).eq("id", reminder_id).execute()
+
+def set_paused_by_id(reminder_id: str, value: bool):
+    supabase.table("reminders").update({"paused": value, "updated_at": "now()"}).eq("id", reminder_id).execute()
