@@ -138,6 +138,7 @@ class UniversalReminderScheduler:
         """
         kind = (r.get("kind") or "").strip().lower()
         cron_expr = (r.get("cron_expr") or "").strip()
+
         # Если для одноразовых сюда попали — вернём None (они будут удалены)
         if not kind or kind == "once":
             return None
@@ -207,6 +208,7 @@ class UniversalReminderScheduler:
                 # row как tuple (с psycopg2 без DictCursor); индексы строго по SELECT
                 rid, chat_id, text, kind, cron_expr, remind_at, next_at = row
                 try:
+                    # В сообщении — только человеческий текст
                     await self.bot.send_message(chat_id, f"⏰ Напоминание: <b>{text}</b>")
                     logger.info("sent reminder id=%s chat_id=%s", rid, chat_id)
                 except Exception as e:

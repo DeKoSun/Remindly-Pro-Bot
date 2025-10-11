@@ -1,7 +1,7 @@
 # FILE: main.py
 import os
 import logging
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
@@ -22,14 +22,12 @@ from aiogram.fsm.state import StatesGroup, State
 from scheduler_core import TournamentScheduler, UniversalReminderScheduler
 from texts import HELP_TEXT
 from db import (
-    # базовые сущности
     upsert_chat,
     upsert_telegram_user,
     get_active_reminders,
     add_reminder,
     delete_reminder_by_id,
     set_paused,
-    # опциональные/вспомогательные
     get_reminder_by_id,
     update_reminder_text,
 )
@@ -43,8 +41,8 @@ if not BOT_TOKEN or not PUBLIC_BASE_URL:
     raise RuntimeError("TELEGRAM_BOT_TOKEN and PUBLIC_BASE_URL must be set")
 
 app = FastAPI()
-logger = logging.getLogger("remindly")
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("remindly")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -60,7 +58,7 @@ class AddReminderSG(StatesGroup):
 
 # =============== ВСПОМОГАТЕЛЬНОЕ =================
 async def _ensure_user_chat(m: types.Message) -> None:
-    """Гарантируем, что в БД есть записи чата/пользователя (устраняет 'первое молчание')."""
+    """Гарантируем, что в БД есть записи чата/пользователя (устраняет «первое молчание»)."""
     try:
         if m.from_user:
             upsert_telegram_user(m.from_user.id)
@@ -70,23 +68,20 @@ async def _ensure_user_chat(m: types.Message) -> None:
 
 def _parse_when(raw: str) -> datetime:
     """
-    Очень простой парсер:
-    - 'через N минут' / '+N мин' / '+N' — относительное время
+    Простой парсер времени:
+    - 'через N минут' / '+N мин' / '+N'
     - 'завтра HH:MM'
     - 'HH:MM' — сегодня (если уже прошло — завтра)
     """
     s = raw.strip().lower().replace("минуту", "1 минуту").replace("мин.", "мин")
     now = datetime.utcnow()
 
-    # через N минут / +N мин
+    # через N минут / +N мин / +N
     if s.startswith("через "):
         parts = s.split()
-        # ожидаем: через <N> минут/минуты/мин
         if len(parts) >= 3 and parts[1].isdigit():
-            minutes = int(parts[1])
-            return now + timedelta(minutes=minutes)
+            return now + timedelta(minutes=int(parts[1]))
     if s.startswith("+"):
-        # +15 мин / +15
         t = s[1:].strip()
         t = t.replace("мин", "").strip()
         if t.isdigit():
@@ -96,26 +91,28 @@ def _parse_when(raw: str) -> datetime:
     if s.startswith("завтра"):
         rest = s.replace("завтра", "").strip()
         hh, mm = rest.split(":")
-        target = datetime.utcnow().replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-        target += timedelta(days=1)
+        target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0) + timedelta(days=1)
         return target
 
-    # HH:MM (сегодня или завтра)
+    # HH:MM (сегодня/завтра)
     if ":" in s and all(part.isdigit() for part in s.split(":")[:2]):
         hh, mm = s.split(":")[:2]
-        target = datetime.utcnow().replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
         return target
 
-    # по умолчанию: +2 минуты (fail-safe)
+    # fail-safe
     return now + timedelta(minutes=2)
+
+def _fmt_utc(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M (UTC)")
 
 # ================== ХЕНДЛЕРЫ ==================
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     await _ensure_user_chat(m)
-    await m.answer("Приветствую тебя! Напиши /help, чтобы увидеть мои команды.")
+    await m.answer("Привет! Напиши /help, чтобы увидеть мои команды.")
 
 @dp.message(Command("help"))
 async def cmd_help(m: types.Message):
@@ -133,13 +130,13 @@ async def cmd_ping(m: types.Message):
     except Exception as e:
         await m.answer(f"pong ❌  | db error: <code>{e}</code>")
 
-# ----- Турнирные (опционально, просто заглушки-обёртки) -----
+# ----- Турнирные (заглушки) -----
 @dp.message(Command("subscribe_tournaments"))
 async def cmd_subscribe_tournaments(m: types.Message):
     await _ensure_user_chat(m)
     if m.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return await m.answer("Эта команда доступна только в группах.")
-    await m.answer("✅ Турнирные напоминания включены в этом чате. (Расписание запущено)")
+    await m.answer("✅ Турнирные напоминания включены в этом чате.")
 
 @dp.message(Command("unsubscribe_tournaments"))
 async def cmd_unsubscribe_tournaments(m: types.Message):
@@ -160,7 +157,7 @@ async def add_start(m: types.Message, state: FSMContext):
     await state.set_state(AddReminderSG.text)
     await m.answer("📝 Введи текст напоминания:")
 
-# Обработка /add@BotName в группах — просто прокидываем в основной /add
+# Обработка /add@BotName (упоминание в группе) — просто прокидываем в общий /add
 @dp.message(Command("add"))
 async def add_start_with_mention(m: types.Message, command: CommandObject, state: FSMContext):
     if await state.get_state():
@@ -183,15 +180,16 @@ async def add_finish(m: types.Message, state: FSMContext):
 
     try:
         remind_at_utc = _parse_when(when_raw)
-        rid = add_reminder(
+        _ = add_reminder(
             user_id=m.from_user.id,
             chat_id=m.chat.id,
             text=text,
             remind_at=remind_at_utc,
         )
         await state.clear()
-        when_str = remind_at_utc.strftime("%Y-%m-%d %H:%M (UTC)")
-        await m.answer(f"✅ Напоминание создано:\n<b>{text}</b>\n🕒 {when_str}\nID: <code>{rid}</code>")
+        when_str = _fmt_utc(remind_at_utc)
+        # ВЫВОД БЕЗ ID, «по-человечески»
+        await m.answer(f"✅ Напоминание создано:\n<b>{text}</b>\n🕒 {when_str}")
     except Exception as e:
         logger.exception("add_finish error: %s", e)
         await m.answer("❌ Не удалось создать напоминание. Попробуй ещё раз или измени формат времени.")
@@ -204,10 +202,12 @@ async def cmd_list(m: types.Message):
         return await m.answer("Пока нет активных напоминаний.")
     lines = []
     for r in items:
+        # поддерживаем dict/tuple (в зависимости от реализации db)
         rid = r["id"] if isinstance(r, dict) else r[0]
         text = r["text"] if isinstance(r, dict) else r[1]
         remind_at = r.get("remind_at") if isinstance(r, dict) else r[2]
-        when_str = remind_at if isinstance(remind_at, str) else str(remind_at)
+        when_str = remind_at if isinstance(remind_at, str) else _fmt_utc(remind_at)
+        # тут ID оставляем — он нужен для /delete /pause /resume
         lines.append(f"• <code>{rid}</code> — {text} — {when_str}")
     await m.answer("🔔 Активные напоминания:\n" + "\n".join(lines))
 
