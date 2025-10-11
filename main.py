@@ -342,7 +342,7 @@ async def cmd_cancel(m: types.Message, state: FSMContext):
     await state.clear()
     await m.answer("Отменено.")
 
-@dp.message(Command("add")))
+@dp.message(Command("add"))
 async def add_start(message: types.Message, state: FSMContext):
     await _ensure_user_chat(message)
     await state.set_state(AddReminder.waiting_for_text)
@@ -539,7 +539,7 @@ async def edit_set_text(m: types.Message, state: FSMContext):
         await m.answer("✅ Текст обновлен. (карточка не найдена)")
 
 # ========= Повторяющиеся напоминания (cron) =========
-@dp.message(Command("add_repeat")))
+@dp.message(Command("add_repeat"))
 async def cmd_add_repeat(m: types.Message):
     await _ensure_user_chat(m)
     if not await _is_editor_or_admin(m):
