@@ -204,8 +204,8 @@ def get_active_reminders(user_id: int):
         .select("*")
         .eq("user_id", user_id)
         .eq("paused", False)
-        .order("remind_at", nulls_first=True)
-        .order("next_at", nulls_first=True)
+        .order("remind_at", nullsfirst=True)   # <-- исправлено
+        .order("next_at", nullsfirst=True)     # <-- исправлено
         .execute()
     )
 
