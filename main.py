@@ -8,7 +8,13 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command
-from aiogram.types import Update, BotCommand, CallbackQuery
+from aiogram.types import (
+    Update,
+    BotCommand,
+    CallbackQuery,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+)
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -17,13 +23,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from db import (
+    # базовые
     upsert_chat,
     set_tournament_subscription,
     add_reminder,
     get_active_reminders,
     delete_reminder_by_id,
     set_paused,
-    # расширения:
+    # расширенные
     add_recurring_reminder,
     set_user_tz,
     set_quiet_hours,
@@ -31,11 +38,11 @@ from db import (
     grant_role,
     revoke_role,
     list_roles,
-    # для inline-кнопок:
+    # для inline-действий
     get_reminder_by_id,
     update_reminder_text,
     set_paused_by_id,
-    update_remind_at,
+    update_remind_at,  # <- важно для «+15 минут» и «завтра»
 )
 
 from scheduler_core import TournamentScheduler, UniversalReminderScheduler
@@ -110,7 +117,7 @@ def _parse_when(text: str) -> datetime | None:
 
     return None
 
-# ======= Представление карточки + клавиатура для inline-кнопок =======
+# ======= Карточка напоминания + inline-клавиатура =======
 def _reminder_card_text(r: dict) -> str:
     rid = str(r["id"])[:8]
     when = r.get("remind_at") or r.get("next_at") or "—"
@@ -137,7 +144,7 @@ def _reminder_kbd(rid: str, paused: bool) -> InlineKeyboardBuilder:
     kb.adjust(2, 1)
     return kb
 
-# ======================= Команды /start /help =======================
+# ======================= /start /help =======================
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     await m.answer("Приветствую тебя! Напиши /help, чтобы увидеть мои команды.")
@@ -146,11 +153,11 @@ async def cmd_start(m: types.Message):
 async def cmd_help(m: types.Message):
     await m.answer(HELP_TEXT, parse_mode=None, disable_web_page_preview=True)
 
-# ======================= Турнирный планировщик ======================
+# ======================= Планировщики =======================
 _tourney = TournamentScheduler(bot)
 _universal = UniversalReminderScheduler(bot)
 
-# ======================= Webhook =======================
+# ======================= Webhook ===========================
 @app.post(f"/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
     try:
@@ -180,13 +187,10 @@ async def on_startup():
         drop_pending_updates=True,
     )
 
+    # Команды для ЛИЧНЫХ чатов (вернёт «кнопочное» меню в DM)
     await bot.set_my_commands(
-        [
+        commands=[
             BotCommand(command="help", description="Показать команды"),
-            BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
-            BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
-            BotCommand(command="tourney_now", description="Прислать пробное напоминание турнира"),
-            BotCommand(command="schedule", description="Показать ближайшие турниры"),
             BotCommand(command="add", description="Создать напоминание"),
             BotCommand(command="list", description="Список напоминаний (с кнопками)"),
             BotCommand(command="delete", description="Удалить напоминание"),
@@ -195,12 +199,34 @@ async def on_startup():
             BotCommand(command="add_repeat", description="Повторяющееся напоминание"),
             BotCommand(command="set_tz", description="Установить таймзону"),
             BotCommand(command="quiet", description="Тихие часы"),
-            BotCommand(command="role", description="Роли в чате"),
             BotCommand(command="cancel", description="Отменить ввод"),
-        ]
+        ],
+        scope=BotCommandScopeAllPrivateChats(),
     )
 
-# ======================= Проверка прав ===============================
+    # Команды для ГРУПП (возвращает иконку меню в группах)
+    await bot.set_my_commands(
+        commands=[
+            BotCommand(command="help", description="Показать команды"),
+            BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
+            BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
+            BotCommand(command="tourney_now", description="Пробное напоминание турнира"),
+            BotCommand(command="schedule", description="Ближайшие старты/время напоминаний"),
+            BotCommand(command="add", description="Создать напоминание"),
+            BotCommand(command="list", description="Список напоминаний"),
+            BotCommand(command="delete", description="Удалить напоминание"),
+            BotCommand(command="pause", description="Пауза напоминания"),
+            BotCommand(command="resume", description="Возобновить напоминание"),
+            BotCommand(command="add_repeat", description="Повторяющееся напоминание"),
+            BotCommand(command="set_tz", description="Установить таймзону"),
+            BotCommand(command="quiet", description="Тихие часы"),
+            BotCommand(command="role", description="Роли чата"),
+            BotCommand(command="cancel", description="Отменить ввод"),
+        ],
+        scope=BotCommandScopeAllGroupChats(),
+    )
+
+# ======================= Проверка прав ======================
 async def _is_admin(message: types.Message) -> bool:
     if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         await message.answer("Эта команда доступна только в групповых чатах.")
@@ -219,7 +245,7 @@ async def _is_editor_or_admin(message: types.Message) -> bool:
         return True
     return has_editor_role(message.chat.id, message.from_user.id)
 
-# ======================= Команды для турниров =======================
+# ======================= Турниры ===========================
 @dp.message(Command("subscribe_tournaments"))
 async def cmd_subscribe_tournaments(m: types.Message):
     if not await _is_admin(m):
@@ -272,7 +298,7 @@ async def cmd_schedule(m: types.Message):
         lines.append(f"• старт {dt.strftime('%d.%m %H:%M')} — напоминание в {rem.strftime('%H:%M')}")
     await m.answer("\n".join(lines))
 
-# ======================= Универсальные напоминания ===================
+# ============ Универсальные (разовые) напоминания ==========
 class AddReminder(StatesGroup):
     waiting_for_text = State()
     waiting_for_time = State()
@@ -355,7 +381,7 @@ async def cmd_resume(message: types.Message):
     set_paused(rid, False)
     await message.answer(f"▶️ Возобновил напоминание <code>{rid}</code>")
 
-# ===== inline-коллбэки: Пауза/Возобновить/Удалить/Редактировать =====
+# ===== inline-коллбэки: пауза/резюм/удалить/редактировать/перенести ===
 @dp.callback_query(lambda c: c.data and c.data.startswith("r:"))
 async def cb_router(c: CallbackQuery, state: FSMContext):
     try:
@@ -401,7 +427,6 @@ async def cb_router(c: CallbackQuery, state: FSMContext):
         return
 
     if action == "shift15":
-        # только для разовых (kind == 'once' или отсутствует)
         if r.get("kind") not in (None, "once"):
             await c.answer("Это действие доступно только для разовых напоминаний.", show_alert=True)
             return
@@ -409,7 +434,6 @@ async def cb_router(c: CallbackQuery, state: FSMContext):
         if not ra:
             await c.answer("Не удалось определить время напоминания.", show_alert=True)
             return
-        # парсим ISO; учитываем возможную 'Z'
         try:
             ra_dt = datetime.fromisoformat(ra.replace("Z", "+00:00"))
         except Exception:
@@ -424,7 +448,6 @@ async def cb_router(c: CallbackQuery, state: FSMContext):
         return
 
     if action == "tomorrow":
-        # только для разовых
         if r.get("kind") not in (None, "once"):
             await c.answer("Это действие доступно только для разовых напоминаний.", show_alert=True)
             return
@@ -437,7 +460,7 @@ async def cb_router(c: CallbackQuery, state: FSMContext):
         except Exception:
             await c.answer("Неверный формат времени напоминания.", show_alert=True)
             return
-        new_dt = ra_dt + timedelta(days=1)  # «завтра в это же время» (UTC)
+        new_dt = ra_dt + timedelta(days=1)
         update_remind_at(rid, new_dt.astimezone(timezone.utc))
         r["remind_at"] = new_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         r["paused"] = False
@@ -473,7 +496,7 @@ async def edit_set_text(m: types.Message, state: FSMContext):
     else:
         await m.answer("✅ Текст обновлен. (карточка не найдена)")
 
-# ======================= Повторяющиеся напоминания ===================
+# ========= Повторяющиеся напоминания (cron) =========
 @dp.message(Command("add_repeat"))
 async def cmd_add_repeat(m: types.Message):
     if not await _is_editor_or_admin(m):
@@ -521,7 +544,7 @@ async def cmd_add_repeat(m: types.Message):
     add_recurring_reminder(m.from_user.id, m.chat.id, text, cron_expr)
     await m.answer(f"✅ Создал повторяющееся напоминание:\n<b>{text}</b>\nCRON: <code>{cron_expr}</code>")
 
-# ======================= Таймзона и «тихие часы» =====================
+# ================= Таймзона и «тихие часы» =================
 @dp.message(Command("set_tz"))
 async def cmd_set_tz(m: types.Message):
     parts = m.text.strip().split()
@@ -549,7 +572,7 @@ async def cmd_quiet(m: types.Message):
     except Exception:
         await m.answer("Формат: /quiet 23-8  или /quiet off")
 
-# ======================= Роли в чате ================================
+# ======================= Роли в чате =======================
 @dp.message(Command("role"))
 async def cmd_role(m: types.Message):
     # /role list
