@@ -656,3 +656,79 @@ async def cmd_role(m: types.Message):
         return
 
     await m.answer("Форматы:\n/role list\n/role grant <user_id> editor\n/role revoke <user_id>")
+
+# ==================== DEBUG-команды (скрытые в меню) ====================
+@dp.message(Command("dbg_insert"))
+async def dbg_insert(m: types.Message):
+    """
+    /dbg_insert [минуты] [текст...]
+    По умолчанию: создаёт напоминание через 1 минуту с текстом "DBG ping".
+    """
+    await _ensure_user_chat(m)
+
+    parts = m.text.strip().split(maxsplit=2)
+    minutes = 1
+    text = "DBG ping"
+    if len(parts) >= 2:
+        try:
+            minutes = int(parts[1])
+        except ValueError:
+            pass
+    if len(parts) == 3:
+        text = parts[2].strip()
+
+    when = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    try:
+        add_reminder(m.from_user.id, m.chat.id, text, when)
+        logger.info(
+            "DBG: inserted reminder user=%s chat=%s when=%s text=%r",
+            m.from_user.id, m.chat.id, when.isoformat(), text
+        )
+        await m.answer(
+            f"✅ DBG: вставил напоминание\n"
+            f"<b>{text}</b>\n"
+            f"⏰ {when.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+            f"(user_id={m.from_user.id}, chat_id={m.chat.id})"
+        )
+    except Exception as e:
+        logger.exception("DBG insert failed")
+        await m.answer(f"❌ DBG insert failed: <code>{e}</code>")
+
+
+@dp.message(Command("dbg_list"))
+async def dbg_list(m: types.Message):
+    """
+    /dbg_list — покажет до 10 активных напоминаний текущего пользователя,
+    чтобы убедиться, что записи реально попадают в БД.
+    """
+    await _ensure_user_chat(m)
+    try:
+        res = get_active_reminders(m.from_user.id)
+        items = res.data or []  # у тебя get_active_reminders возвращает .data
+        if not items:
+            await m.answer("DBG: активных напоминаний не найдено.")
+            return
+        lines = ["DBG: активные напоминания:"]
+        for r in items[:10]:
+            rid = str(r["id"])[:8]
+            when = r.get("remind_at") or r.get("next_at")
+            lines.append(f"• {rid} | {when} | {r.get('kind','once')} | {r['text']}")
+        await m.answer("\n".join(lines))
+    except Exception as e:
+        logger.exception("DBG list failed")
+        await m.answer(f"❌ DBG list failed: <code>{e}</code>")
+
+
+@dp.message(Command("dbg_who"))
+async def dbg_who(m: types.Message):
+    """
+    /dbg_who — быстрый вывод идентификаторов и факт регистрации в родительских таблицах.
+    Удобно, чтобы исключить ошибки внешних ключей.
+    """
+    await _ensure_user_chat(m)
+    await m.answer(
+        "DBG who:\n"
+        f"user_id = <code>{m.from_user.id}</code>\n"
+        f"chat_id = <code>{m.chat.id}</code>\n"
+        "Записи в telegram_users/telegram_chats должны быть созданы автоматически."
+    )
