@@ -272,6 +272,8 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
 
     try:
         cron_expr = _parse_repeat_to_cron(sched_raw)
+        if not croniter.is_valid(cron_expr):
+            return await m.answer("❌ Неверный CRON. Пример: <code>*/5 * * * *</code> или напиши «каждую минуту».")
         next_at = _cron_next_utc(cron_expr)
         _ = add_recurring_reminder(
             user_id=m.from_user.id,

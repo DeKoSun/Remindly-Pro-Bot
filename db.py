@@ -20,7 +20,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # Прямое подключение к Postgres того же кластера (для транзакций/миграций).
-# Для Supabase используйте URI “Transaction pooler” (порт 6543, sslmode=require).
+# Используйте URI “Transaction pooler” (порт 6543, sslmode=require).
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
@@ -255,7 +255,7 @@ def update_remind_at(reminder_id: str, when_utc_dt: datetime):
 def get_due_once_and_recurring(window_minutes: int = 10):
     """
     Возвращает (once_list, cron_list) для окна догонки window_minutes.
-    Важно: сравнения по ISO-строкам в UTC (RLS безопасно, сервисный ключ).
+    Сравнения по ISO-строкам в UTC (RLS безопасно, сервисный ключ).
     """
     now = datetime.now(timezone.utc)
     win = now - timedelta(minutes=window_minutes)
