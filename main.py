@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.types import (
     Update,
     BotCommand,
@@ -28,8 +28,6 @@ from db import (
     add_reminder,
     delete_reminder_by_id,
     set_paused,
-    get_reminder_by_id,
-    update_reminder_text,
 )
 
 # ================== Конфигурация ==================
@@ -153,16 +151,10 @@ async def cmd_tourney_now(m: types.Message):
 # ----- Универсальные напоминания -----
 @dp.message(Command("add"))
 async def add_start(m: types.Message, state: FSMContext):
+    # Поддерживает и /add, и /add@BotName (в группе)
     await _ensure_user_chat(m)
     await state.set_state(AddReminderSG.text)
     await m.answer("📝 Введи текст напоминания:")
-
-# Обработка /add@BotName (упоминание в группе) — просто прокидываем в общий /add
-@dp.message(Command("add"))
-async def add_start_with_mention(m: types.Message, command: CommandObject, state: FSMContext):
-    if await state.get_state():
-        return
-    return await add_start(m, state)
 
 @dp.message(AddReminderSG.text)
 async def add_wait_when(m: types.Message, state: FSMContext):
@@ -207,7 +199,7 @@ async def cmd_list(m: types.Message):
         text = r["text"] if isinstance(r, dict) else r[1]
         remind_at = r.get("remind_at") if isinstance(r, dict) else r[2]
         when_str = remind_at if isinstance(remind_at, str) else _fmt_utc(remind_at)
-        # тут ID оставляем — он нужен для /delete /pause /resume
+        # ID нужен только здесь — для управления:
         lines.append(f"• <code>{rid}</code> — {text} — {when_str}")
     await m.answer("🔔 Активные напоминания:\n" + "\n".join(lines))
 

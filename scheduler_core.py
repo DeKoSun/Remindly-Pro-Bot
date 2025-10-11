@@ -216,12 +216,12 @@ class UniversalReminderScheduler:
 
                 # Пост-обработка
                 try:
-                    with get_conn() as c:
-                        cur = c.cursor()
+                    with get_conn() as c2:
+                        cur2 = c2.cursor()
                         k = (kind or "").strip().lower()
                         if not k or k == "once":
                             # одноразовое — удаляем
-                            cur.execute("DELETE FROM reminders WHERE id = %s", (rid,))
+                            cur2.execute("DELETE FROM reminders WHERE id = %s", (rid,))
                         else:
                             # повторяющееся — пересчитать next_at
                             r_dict = {
@@ -234,10 +234,10 @@ class UniversalReminderScheduler:
                             nxt = self._calc_next_for_kind(r_dict, now_utc)
                             if nxt is None:
                                 # предохранитель: не зацикливаем
-                                cur.execute("UPDATE reminders SET next_at = NULL WHERE id = %s", (rid,))
+                                cur2.execute("UPDATE reminders SET next_at = NULL WHERE id = %s", (rid,))
                             else:
-                                cur.execute("UPDATE reminders SET next_at = %s WHERE id = %s", (nxt, rid))
-                        c.commit()
+                                cur2.execute("UPDATE reminders SET next_at = %s WHERE id = %s", (nxt, rid))
+                        c2.commit()
                 except Exception:
                     logger.exception("Post-process failed for reminder id=%s", rid)
 
