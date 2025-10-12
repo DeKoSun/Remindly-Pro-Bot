@@ -1,4 +1,4 @@
-# FILE: main.py
+# main.py
 import os
 import logging
 from datetime import datetime, timedelta, timezone

@@ -1,4 +1,4 @@
-# FILE: db.py
+# db.py
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -95,12 +95,10 @@ def upsert_chat(chat_id: int, type_: str, title: str | None):
     """
     Совместим с двумя схемами:
     - новая: telegram_chats (минимум chat_id, created_at) — просто гарантируем наличие строки;
-    - старая: таблица chats с полями type/title.
+    - старая: таблица chats с полями type/title (если она есть, обновим).
     """
-    # новая схема — просто гарантируем FK
     upsert_telegram_chat(chat_id)
 
-    # старая схема (если есть)
     if _table_exists("chats"):
         with get_conn() as c:
             cur = c.cursor()
@@ -134,7 +132,6 @@ def set_tournament_subscription(chat_id: int, value: bool, user_id: int | None =
             supabase.table("tournament_subscribers") \
                 .delete().eq("chat_id", chat_id).eq("user_id", user_id).execute()
     elif _table_exists("chats"):
-        # бэкап для старой схемы
         with get_conn() as c:
             cur = c.cursor()
             cur.execute(
@@ -207,8 +204,8 @@ def get_active_reminders(user_id: int):
         .select("*")
         .eq("user_id", user_id)
         .eq("paused", False)
-        .order("remind_at", nullsfirst=True)   # FIX
-        .order("next_at", nullsfirst=True)     # FIX
+        .order("remind_at", nullsfirst=True)   # <-- фикс
+        .order("next_at", nullsfirst=True)     # <-- фикс
         .execute()
     )
 

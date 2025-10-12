@@ -108,6 +108,11 @@ class UniversalReminderScheduler:
     """
     Фоновый поллер БД: берёт «просроченные» одноразовые/повторяющиеся напоминания
     и отправляет сообщения. Для повторяющихся рассчитывает следующее next_at.
+    Ожидаемые колонки в public.reminders:
+      id (uuid PK), user_id int8, chat_id int8, text text,
+      paused bool default false, created_at timestamptz default now(),
+      kind text, cron_expr text, remind_at timestamptz, next_at timestamptz,
+      created_by int8 NULL, updated_at timestamptz NULL
     """
 
     def __init__(self, bot: Bot, poll_interval_sec: int = 30):
