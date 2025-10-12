@@ -20,7 +20,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 # HTTP-клиент к таблицам Supabase (сервисный ключ обходит RLS)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Прямое подключение к Postgres того же кластера (если нужно выполнить «сырые» SQL/транзакции).
+# Прямое подключение к Postgres того же кластера (для сырых SQL/транзакций).
 # Используй URI **Transaction pooler** (порт 6543, sslmode=require).
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -60,25 +60,22 @@ def _table_exists(name: str) -> bool:
         return cur.fetchone() is not None
 
 
-# ========= CRON ВАЛИДАЦИЯ/НОРМАЛИЗАЦИЯ (можно звать из main.py) =========
+# ========= CRON ВАЛИДАЦИЯ/НОРМАЛИЗАЦИЯ =========
 
 def normalize_cron(expr: str) -> str:
     """
-    Простейшая нормализация «человечных» шаблонов в cron-строку.
-    Поддерживает:
+    Поддержка «человечных» шаблонов:
       - 'каждую минуту'        -> '* * * * *'
       - 'ежедневно HH:MM'      -> 'MM HH * * *'
-      - 'HH:MM' (эквивалентно) -> 'MM HH * * *'
-      - Иначе — возвращает expr без изменений (для полноценного cron).
+      - 'HH:MM'                -> 'MM HH * * *'
+      - иначе — возвращает expr как есть.
     """
     s = (expr or "").strip().lower()
     if s == "каждую минуту":
         return "* * * * *"
 
-    # 'ежедневно 09:30' или просто '09:30'
     if s.startswith("ежедневно"):
-        rest = s.replace("ежедневно", "", 1).strip()
-        s = rest
+        s = s.replace("ежедневно", "", 1).strip()
 
     if ":" in s:
         try:
@@ -89,12 +86,10 @@ def normalize_cron(expr: str) -> str:
                 return f"{mm} {hh} * * *"
         except Exception:
             pass
-
     return expr
 
 
 def validate_cron(expr: str) -> bool:
-    """Проверяет, парсится ли cron выражение croniter-ом."""
     try:
         croniter(expr, datetime.now(timezone.utc)).get_next(datetime)
         return True
@@ -102,10 +97,9 @@ def validate_cron(expr: str) -> bool:
         return False
 
 
-# ========= РОДИТЕЛЬСКИЕ СТРОКИ ДЛЯ FK (telegram_* таблицы) =========
+# ========= РОДИТЕЛЬСКИЕ СТРОКИ ДЛЯ FK =========
 
 def upsert_telegram_user(user_id: int):
-    """Гарантируем существование строки в public.telegram_users (для FK)."""
     if not _table_exists("telegram_users"):
         return
     supabase.table("telegram_users").upsert({
@@ -115,7 +109,6 @@ def upsert_telegram_user(user_id: int):
 
 
 def upsert_telegram_chat(chat_id: int):
-    """Гарантируем существование строки в public.telegram_chats (для FK)."""
     if not _table_exists("telegram_chats"):
         return
     supabase.table("telegram_chats").upsert({
@@ -125,7 +118,6 @@ def upsert_telegram_chat(chat_id: int):
 
 
 def ensure_parent_rows(user_id: Optional[int], chat_id: Optional[int]):
-    """Создаём родительские строки под FK перед вставками в другие таблицы."""
     if user_id is not None:
         upsert_telegram_user(user_id)
     if chat_id is not None:
@@ -135,13 +127,7 @@ def ensure_parent_rows(user_id: Optional[int], chat_id: Optional[int]):
 # ========= ЧАТЫ / ПОДПИСКИ НА ТУРНИРЫ =========
 
 def upsert_chat(chat_id: int, type_: str, title: Optional[str]):
-    """
-    Совместим с двумя схемами:
-    - новая: telegram_chats (минимум chat_id, created_at) — просто гарантируем наличие строки;
-    - старая: таблица chats с полями type/title (если она есть, обновим).
-    """
     upsert_telegram_chat(chat_id)
-
     if _table_exists("chats"):
         with get_conn() as c:
             cur = c.cursor()
@@ -164,7 +150,7 @@ def set_tournament_subscription(chat_id: int, value: bool, user_id: Optional[int
 
     if _table_exists("tournament_subscribers"):
         if user_id is None:
-            user_id = 0  # если не знаем автора — ставим 0
+            user_id = 0
         if value:
             supabase.table("tournament_subscribers").upsert({
                 "user_id": user_id,
@@ -187,7 +173,7 @@ def set_tournament_subscription(chat_id: int, value: bool, user_id: Optional[int
 def get_tournament_subscribed_chats():
     if _table_exists("tournament_subscribers"):
         rows = supabase.table("tournament_subscribers").select("chat_id").execute().data or []
-        return [(r["chat_id"], None) for r in rows]  # (chat_id, tz)
+        return [(r["chat_id"], None) for r in rows]
     elif _table_exists("chats"):
         with get_conn() as c:
             cur = c.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -197,7 +183,8 @@ def get_tournament_subscribed_chats():
         return []
 
 
-# ========= УНИВЕРСАЛЬНЫЕ НАПОМИНАНИЯ (public.reminders) =========
+# ========= УНИВЕРСАЛЬНЫЕ НАПОМИНАНИЯ =========
+# public.reminders:
 #   id uuid PK, user_id bigint (FK -> telegram_users.user_id)
 #   chat_id bigint (FK -> telegram_chats.chat_id)
 #   text text, kind text ('once'|'cron')
@@ -219,37 +206,45 @@ def add_reminder(user_id: int, chat_id: int, text: str, remind_at: datetime):
     }).execute()
 
 
-def add_recurring_reminder(user_id: int, chat_id: int, text: str, cron_expr: str):
+def add_recurring_reminder(
+    user_id: int,
+    chat_id: int,
+    text: str,
+    cron_expr: str,
+    *,
+    next_at: Optional[datetime] = None,
+) -> dict:
     """
     Повторяющееся (cron).
-    ВНИМАНИЕ: сюда должен приходить УЖЕ валидный cron.
+    Совместимо со «старым» вызовом, где передавали next_at именованным аргументом.
+    Если next_at не задан — рассчитываем его сами.
+    Возвращаем dict вставленной строки (как делает supabase-py).
     """
     ensure_parent_rows(user_id, chat_id)
-    now = datetime.now(timezone.utc)
-    # Валидируем, чтобы не ловить это выше по стеку
+
+    cron_expr = normalize_cron(cron_expr)
     try:
-        nxt = croniter(cron_expr, now).get_next(datetime)
+        if next_at is None:
+            next_at = croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime)
     except (CroniterBadCronError, ValueError):
         raise ValueError("Bad cron expression")
 
-    return supabase.table("reminders").insert({
+    res = supabase.table("reminders").insert({
         "user_id": user_id,
         "chat_id": chat_id,
         "text": text,
         "kind": "cron",
         "cron_expr": cron_expr,
-        "next_at": _iso(nxt),
+        "next_at": _iso(next_at),
         "paused": False,
         "created_by": user_id,
-        "created_at": _iso(now),
+        "created_at": _iso(datetime.now(timezone.utc)),
     }).execute()
+    return res.data[0] if res.data else {}
 
 
 def get_active_reminders(user_id: int):
-    """
-    Вернёт активные напоминания пользователя.
-    Важно: параметр сортировки — `nullsfirst=True`.
-    """
+    """Активные напоминания пользователя. nullsfirst — правильное имя параметра в supabase-py."""
     return (
         supabase.table("reminders")
         .select("*")
@@ -303,7 +298,7 @@ def update_remind_at(reminder_id: str, when_utc_dt: datetime):
 def get_due_once_and_recurring(window_minutes: int = 10) -> Tuple[list, list]:
     """
     Возвращает (once_list, cron_list) для окна догонки window_minutes.
-    Сравнения по ISO-строкам в UTC (RLS безопасно, сервисный ключ).
+    Сравниваем ISO-строки в UTC (сервисный ключ обходит RLS).
     """
     now = datetime.now(timezone.utc)
     win = now - timedelta(minutes=window_minutes)
@@ -395,10 +390,7 @@ def list_roles(chat_id: int):
 
 def dbg_insert_once(user_id: int, chat_id: int, minutes: int = 1, text: Optional[str] = None):
     """
-    Форсируем вставку «одноразового» напоминания через N минут.
-    1) гарантируем родительские строки под FK,
-    2) пишем в public.reminders.
-    Возвращает dict вставленной строки.
+    Форс-вставка «одноразового» напоминания через N минут.
     """
     ensure_parent_rows(user_id, chat_id)
     when = datetime.now(timezone.utc) + timedelta(minutes=minutes)
