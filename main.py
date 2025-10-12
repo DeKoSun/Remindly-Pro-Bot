@@ -175,7 +175,7 @@ async def cmd_help(m: types.Message):
     await _ensure_user_chat(m)
     await m.answer(HELP_TEXT, disable_web_page_preview=True)
 
-@dp.message(Command("ping")))
+@dp.message(Command("ping"))
 async def cmd_ping(m: types.Message):
     """Быстрый health-check: БД и планировщики."""
     await _ensure_user_chat(m)
