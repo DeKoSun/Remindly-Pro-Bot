@@ -2,7 +2,7 @@
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Tuple, Optional
+from typing import Optional, Tuple, Union, List
 
 import psycopg2
 import psycopg2.extras
@@ -10,18 +10,17 @@ from supabase import create_client
 from croniter import croniter, CroniterBadCronError
 
 
-# ========= ENV / КЛИЕНТЫ =========
+# ========= ENV / CLIENTS =========
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL и SUPABASE_SERVICE_KEY должны быть заданы")
 
-# HTTP-клиент к таблицам Supabase (сервисный ключ обходит RLS)
+# HTTP-клиент (сервисный ключ обходит RLS)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Прямое подключение к Postgres того же кластера (для сырых SQL/транзакций).
-# Используй URI **Transaction pooler** (порт 6543, sslmode=require).
+# Прямое подключение в Postgres (используй Transaction Pooler: порт 6543, sslmode=require)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
@@ -36,10 +35,9 @@ def get_conn():
         conn.close()
 
 
-# ========= ВСПОМОГАТЕЛЬНОЕ =========
+# ========= HELPERS =========
 
 def _iso(dt: datetime) -> str:
-    """UTC ISO8601 строка (всегда с таймзоной)."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
@@ -60,15 +58,15 @@ def _table_exists(name: str) -> bool:
         return cur.fetchone() is not None
 
 
-# ========= CRON ВАЛИДАЦИЯ/НОРМАЛИЗАЦИЯ =========
+# ========= CRON нормализация/валидация =========
 
 def normalize_cron(expr: str) -> str:
     """
     Поддержка «человечных» шаблонов:
-      - 'каждую минуту'        -> '* * * * *'
-      - 'ежедневно HH:MM'      -> 'MM HH * * *'
-      - 'HH:MM'                -> 'MM HH * * *'
-      - иначе — возвращает expr как есть.
+      - 'каждую минуту'         -> '* * * * *'
+      - 'ежедневно HH:MM'       -> 'MM HH * * *'
+      - 'HH:MM'                  -> 'MM HH * * *'
+      - иначе — возвращаем как есть.
     """
     s = (expr or "").strip().lower()
     if s == "каждую минуту":
@@ -97,7 +95,7 @@ def validate_cron(expr: str) -> bool:
         return False
 
 
-# ========= РОДИТЕЛЬСКИЕ СТРОКИ ДЛЯ FK =========
+# ========= Родительские строки для FK =========
 
 def upsert_telegram_user(user_id: int):
     if not _table_exists("telegram_users"):
@@ -124,7 +122,7 @@ def ensure_parent_rows(user_id: Optional[int], chat_id: Optional[int]):
         upsert_telegram_chat(chat_id)
 
 
-# ========= ЧАТЫ / ПОДПИСКИ НА ТУРНИРЫ =========
+# ========= Турнирные подписки / чаты (опционально) =========
 
 def upsert_chat(chat_id: int, type_: str, title: Optional[str]):
     upsert_telegram_chat(chat_id)
@@ -183,7 +181,7 @@ def get_tournament_subscribed_chats():
         return []
 
 
-# ========= УНИВЕРСАЛЬНЫЕ НАПОМИНАНИЯ =========
+# ========= Напоминания =========
 # public.reminders:
 #   id uuid PK, user_id bigint (FK -> telegram_users.user_id)
 #   chat_id bigint (FK -> telegram_chats.chat_id)
@@ -214,14 +212,8 @@ def add_recurring_reminder(
     *,
     next_at: Optional[datetime] = None,
 ) -> dict:
-    """
-    Повторяющееся (cron).
-    Совместимо со «старым» вызовом, где передавали next_at именованным аргументом.
-    Если next_at не задан — рассчитываем его сами.
-    Возвращаем dict вставленной строки (как делает supabase-py).
-    """
+    """Повторяющееся напоминание (cron)."""
     ensure_parent_rows(user_id, chat_id)
-
     cron_expr = normalize_cron(cron_expr)
     try:
         if next_at is None:
@@ -244,7 +236,7 @@ def add_recurring_reminder(
 
 
 def get_active_reminders(user_id: int):
-    """Активные напоминания пользователя. nullsfirst — правильное имя параметра в supabase-py."""
+    """Активные напоминания пользователя (для DM)."""
     return (
         supabase.table("reminders")
         .select("*")
@@ -254,6 +246,22 @@ def get_active_reminders(user_id: int):
         .order("next_at", nullsfirst=True)
         .execute()
     )
+
+
+def get_active_reminders_for_chat(chat_id: int, *, include_paused: bool = True) -> List[dict]:
+    """Список напоминаний для чата (для отображения пользователю с нумерацией)."""
+    q = (
+        supabase.table("reminders")
+        .select("*")
+        .eq("chat_id", chat_id)
+        .order("remind_at", nullsfirst=True)
+        .order("next_at", nullsfirst=True)
+        .order("created_at")
+    )
+    if not include_paused:
+        q = q.eq("paused", False)
+    res = q.execute()
+    return res.data or []
 
 
 def get_reminder_by_id(reminder_id: str):
@@ -298,7 +306,6 @@ def update_remind_at(reminder_id: str, when_utc_dt: datetime):
 def get_due_once_and_recurring(window_minutes: int = 10) -> Tuple[list, list]:
     """
     Возвращает (once_list, cron_list) для окна догонки window_minutes.
-    Сравниваем ISO-строки в UTC (сервисный ключ обходит RLS).
     """
     now = datetime.now(timezone.utc)
     win = now - timedelta(minutes=window_minutes)
@@ -334,7 +341,7 @@ def advance_recurring(reminder_id: str, cron_expr: str):
     }).eq("id", reminder_id).execute()
 
 
-# ========= ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ =========
+# ========= Пользовательские настройки =========
 
 def set_user_tz(user_id: int, tz_name: str):
     upsert_telegram_user(user_id)
@@ -360,7 +367,7 @@ def get_user_prefs(user_id: int):
     return res.data or {}
 
 
-# ========= РОЛИ В ЧАТАХ =========
+# ========= Роли в чатах =========
 
 def grant_role(chat_id: int, user_id: int, role: str):
     ensure_parent_rows(user_id, chat_id)
@@ -386,12 +393,9 @@ def list_roles(chat_id: int):
     return res.data or []
 
 
-# ========= DEBUG / DIAGNOSTICS =========
+# ========= DEBUG =========
 
 def dbg_insert_once(user_id: int, chat_id: int, minutes: int = 1, text: Optional[str] = None):
-    """
-    Форс-вставка «одноразового» напоминания через N минут.
-    """
     ensure_parent_rows(user_id, chat_id)
     when = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     if not text:
@@ -409,13 +413,61 @@ def dbg_insert_once(user_id: int, chat_id: int, minutes: int = 1, text: Optional
     return res.data[0] if res.data else None
 
 
+# ========= HIGH-LEVEL «по номеру или по UUID» =========
+
+Selector = Union[str, int]
+
+def resolve_selector_to_id(chat_id: int, selector: Selector, user_id: Optional[int] = None) -> Optional[str]:
+    """
+    Возвращает UUID напоминания по:
+      - UUID (строка вида 'xxxx-...') — просто валидируем наличие;
+      - порядковому номеру (1..N) в списке напоминаний чата (сначала ближайшие).
+    Если user_id указан — дополнительно фильтруем по автору (created_by).
+    """
+    # Если это UUID — попробуем взять как есть
+    if isinstance(selector, str) and "-" in selector:
+        row = get_reminder_by_id(selector)
+        if row and row.get("chat_id") == chat_id and (user_id is None or row.get("created_by") == user_id):
+            return row["id"]
+        return None
+
+    # Иначе — индекс
+    try:
+        idx = int(selector)
+    except Exception:
+        return None
+    if idx <= 0:
+        return None
+
+    rows = get_active_reminders_for_chat(chat_id, include_paused=True)
+    if user_id is not None:
+        rows = [r for r in rows if r.get("created_by") == user_id]
+    if 1 <= idx <= len(rows):
+        return rows[idx - 1]["id"]
+    return None
+
+
+def pause_or_resume(chat_id: int, selector: Selector, value: bool, user_id: Optional[int] = None):
+    rid = resolve_selector_to_id(chat_id, selector, user_id=user_id)
+    if not rid:
+        return None
+    return set_paused_by_id(rid, value)
+
+
+def delete_by_selector(chat_id: int, selector: Selector, user_id: Optional[int] = None):
+    rid = resolve_selector_to_id(chat_id, selector, user_id=user_id)
+    if not rid:
+        return None
+    return delete_reminder_by_id(rid)
+
+
 __all__ = [
     # parents
     "upsert_telegram_user", "upsert_telegram_chat", "ensure_parent_rows",
     # tournaments / chats
     "upsert_chat", "set_tournament_subscription", "get_tournament_subscribed_chats",
     # reminders
-    "add_reminder", "add_recurring_reminder", "get_active_reminders",
+    "add_reminder", "add_recurring_reminder", "get_active_reminders", "get_active_reminders_for_chat",
     "get_reminder_by_id", "delete_reminder_by_id", "set_paused", "set_paused_by_id",
     "update_reminder_text", "update_remind_at", "get_due_once_and_recurring", "advance_recurring",
     # prefs
@@ -426,6 +478,8 @@ __all__ = [
     "dbg_insert_once",
     # cron helpers
     "normalize_cron", "validate_cron",
+    # selectors
+    "resolve_selector_to_id", "pause_or_resume", "delete_by_selector",
     # shared
     "supabase", "get_conn",
 ]

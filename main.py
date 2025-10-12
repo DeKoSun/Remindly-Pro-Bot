@@ -14,9 +14,11 @@ from aiogram.types import (
     ChatMemberUpdated,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
+    CallbackQuery,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from croniter import croniter
 
@@ -26,9 +28,10 @@ from texts import HELP_TEXT
 from db import (
     upsert_chat,
     upsert_telegram_user,
-    get_active_reminders,
-    add_reminder,              # once
-    add_recurring_reminder,    # cron
+    get_active_reminders,           # для /ping
+    get_active_reminders_for_chat,  # для рендера списка с кнопками
+    add_reminder,                   # once
+    add_recurring_reminder,         # cron
     delete_reminder_by_id,
     set_paused,
 )
@@ -164,6 +167,47 @@ def _fmt_utc(dt: datetime) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC)")
 
+# ========= Рендер списка с кнопками =========
+def _build_reminders_list_text(rows: list[dict]) -> str:
+    if not rows:
+        return "Пока нет напоминаний."
+    lines = ["<b>Напоминания этого чата:</b>"]
+    for idx, r in enumerate(rows, start=1):
+        text = r.get("text", "—")
+        kind = r.get("kind") or "once"
+        paused = bool(r.get("paused"))
+        remind_at = r.get("remind_at")
+        next_at = r.get("next_at")
+        when = remind_at if kind == "once" else next_at
+        status = "⏸" if paused else ("🔁" if kind != "once" else "•")
+        lines.append(f"{idx}. {status} <b>{text}</b> — {_fmt_utc(when) if when else '—'}")
+    return "\n".join(lines)
+
+def _build_reminders_keyboard(rows: list[dict]) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        rid = r["id"]
+        paused = bool(r.get("paused"))
+        # первая кнопка — пауза/возобновить
+        if paused:
+            kb.button(text="▶️ Возобновить", callback_data=f"rem:resume:{rid}")
+        else:
+            kb.button(text="⏸ Пауза", callback_data=f"rem:pause:{rid}")
+        # вторая — удалить
+        kb.button(text="🗑 Удалить", callback_data=f"rem:delete:{rid}")
+        kb.adjust(2)
+    return kb
+
+async def _refresh_list_message(chat_id: int, message: types.Message):
+    rows = get_active_reminders_for_chat(chat_id, include_paused=True)
+    text = _build_reminders_list_text(rows)
+    kb = _build_reminders_keyboard(rows)
+    try:
+        await message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
+    except Exception:
+        # если редактировать нельзя (например, слишком старое сообщение) — просто отправим новое
+        await message.answer(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
+
 # ================== ХЕНДЛЕРЫ ==================
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
@@ -276,27 +320,17 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
         await state.clear()
         return await m.answer("❌ Текст пустой. Попробуй ещё раз: /add_repeat")
 
-    # 1) Парсим в CRON и показываем, что получилось
     cron_expr = _parse_repeat_to_cron(sched_raw)
-    is_valid = False
     try:
-        is_valid = croniter.is_valid(cron_expr)
+        if not croniter.is_valid(cron_expr):
+            raise ValueError("bad cron")
+        next_at = _cron_next_utc(cron_expr)
     except Exception as e:
-        # чтобы видеть редкие ошибки в croniter
-        return await m.answer(f"❌ croniter error: <code>{e}</code>\nexpr: <code>{cron_expr}</code>")
-
-    if not is_valid:
         return await m.answer(
             "❌ Неверное расписание.\n"
             f"expr: <code>{cron_expr}</code>\n"
             "Попробуй: «каждую минуту», «ежедневно HH:MM», «HH:MM» или «cron: */5 * * * *»."
         )
-
-    # 2) Считаем next_at и пробуем вставить в БД. В ответ отдадим ПОЛНУЮ причину сбоя
-    try:
-        next_at = _cron_next_utc(cron_expr)
-    except Exception as e:
-        return await m.answer(f"❌ Не удалось вычислить ближайшее время: <code>{e}</code>\nexpr: <code>{cron_expr}</code>")
 
     try:
         _ = add_recurring_reminder(
@@ -314,76 +348,49 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
             f"🕒 Ближайшее: {_fmt_utc(next_at)}"
         )
     except Exception as e:
-        # здесь хотим видеть реальную SQL-ошибку/ограничение/NULL-поле
         return await m.answer(
             "❌ DB insert failed.\n"
             f"reason: <code>{e}</code>\n"
             f"expr: <code>{cron_expr}</code>\nnext_at: <code>{_fmt_utc(next_at)}</code>"
         )
 
-# ---------- Управление ----------
+# ---------- Управление списком с кнопками ----------
 @dp.message(Command("list"))
 async def cmd_list(m: types.Message):
     await _ensure_user_chat(m)
-    items = get_active_reminders(m.from_user.id)
-    if not items:
-        return await m.answer("Пока нет активных напоминаний.")
-    lines = []
-    for r in items:
-        rid = r["id"] if isinstance(r, dict) else r[0]
-        text = r["text"] if isinstance(r, dict) else r[1]
-        kind = (r.get("kind") if isinstance(r, dict) else None) or "once"
-        remind_at = r.get("remind_at") if isinstance(r, dict) else None
-        next_at = r.get("next_at") if isinstance(r, dict) else None
+    rows = get_active_reminders_for_chat(m.chat.id, include_paused=True)
+    if not rows:
+        return await m.answer("Пока нет напоминаний в этом чате.")
+    text = _build_reminders_list_text(rows)
+    kb = _build_reminders_keyboard(rows)
+    await m.answer(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
 
-        when_dt = remind_at if kind == "once" else next_at
-        when_str = _fmt_utc(when_dt)
-
-        # ID показываем только здесь — чтобы было чем управлять:
-        lines.append(f"• <code>{rid}</code> — {text} — {when_str} — {('🔁' if kind!='once' else '•')}")
-    await m.answer("🔔 Активные напоминания:\n" + "\n".join(lines))
-
-@dp.message(Command("delete"))
-async def cmd_delete(m: types.Message):
-    await _ensure_user_chat(m)
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        return await m.answer("Укажи ID: /delete <id>")
-    rid = parts[1].strip()
+@dp.callback_query(lambda c: c.data and c.data.startswith("rem:"))
+async def on_reminder_action(cb: CallbackQuery):
     try:
-        delete_reminder_by_id(rid, m.chat.id)
-        await m.answer("🗑️ Напоминание удалено.")
-    except Exception as e:
-        logger.exception("delete error: %s", e)
-        await m.answer("❌ Не удалось удалить напоминание.")
+        _, action, rid = cb.data.split(":", 2)  # rem:pause:<uuid>
+    except ValueError:
+        return await cb.answer("Некорректные данные.", show_alert=True)
 
-@dp.message(Command("pause"))
-async def cmd_pause(m: types.Message):
-    await _ensure_user_chat(m)
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        return await m.answer("Укажи ID: /pause <id>")
-    rid = parts[1].strip()
     try:
-        set_paused(reminder_id=rid, chat_id=m.chat.id, paused=True)
-        await m.answer("⏸️ Напоминание поставлено на паузу.")
+        if action == "pause":
+            set_paused(rid, True)
+            await cb.answer("Поставлено на паузу ✅")
+        elif action == "resume":
+            set_paused(rid, False)
+            await cb.answer("Возобновлено ✅")
+        elif action == "delete":
+            delete_reminder_by_id(rid)
+            await cb.answer("Удалено 🗑️")
+        else:
+            return await cb.answer("Неизвестное действие.", show_alert=True)
     except Exception as e:
-        logger.exception("pause error: %s", e)
-        await m.answer("❌ Не удалось поставить на паузу.")
+        logger.exception("callback action failed: %s", e)
+        return await cb.answer("Операция не удалась 😕", show_alert=True)
 
-@dp.message(Command("resume"))
-async def cmd_resume(m: types.Message):
-    await _ensure_user_chat(m)
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        return await m.answer("Укажи ID: /resume <id>")
-    rid = parts[1].strip()
-    try:
-        set_paused(reminder_id=rid, chat_id=m.chat.id, paused=False)
-        await m.answer("▶️ Напоминание возобновлено.")
-    except Exception as e:
-        logger.exception("resume error: %s", e)
-        await m.answer("❌ Не удалось возобновить напоминание.")
+    # Обновляем сообщение со списком
+    if cb.message:
+        await _refresh_list_message(cb.message.chat.id, cb.message)
 
 # ====== Авто-регистрация при добавлении бота в чат ======
 @dp.my_chat_member()
@@ -436,10 +443,7 @@ async def on_startup():
             BotCommand(command="help", description="Показать команды"),
             BotCommand(command="add", description="Создать разовое напоминание"),
             BotCommand(command="add_repeat", description="Создать повторяющееся"),
-            BotCommand(command="list", description="Список напоминаний"),
-            BotCommand(command="delete", description="Удалить по ID"),
-            BotCommand(command="pause", description="Пауза по ID"),
-            BotCommand(command="resume", description="Возобновить по ID"),
+            BotCommand(command="list", description="Список (с кнопками)"),
             BotCommand(command="ping", description="Проверка состояния"),
         ],
         scope=BotCommandScopeAllPrivateChats(),
@@ -451,10 +455,7 @@ async def on_startup():
             BotCommand(command="help", description="Показать команды"),
             BotCommand(command="add", description="Создать разовое напоминание"),
             BotCommand(command="add_repeat", description="Создать повторяющееся"),
-            BotCommand(command="list", description="Список напоминаний"),
-            BotCommand(command="delete", description="Удалить по ID"),
-            BotCommand(command="pause", description="Пауза по ID"),
-            BotCommand(command="resume", description="Возобновить по ID"),
+            BotCommand(command="list", description="Список (с кнопками)"),
             BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
             BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
             BotCommand(command="tourney_now", description="Пробное турнирное уведомление"),
