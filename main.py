@@ -5,9 +5,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatType
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
     Update,
@@ -71,6 +71,7 @@ async def _ensure_user_chat(m: types.Message) -> None:
         logger.exception("ensure_user_chat failed: %s", e)
 
 def _parse_when_once(raw: str) -> datetime:
+    """Примеры: '14:30', 'завтра 10:00', 'через 25 минут', '+15'."""
     s = (raw or "").strip().lower()
     s = (
         s.replace("минуту", "1 минуту")
@@ -80,22 +81,26 @@ def _parse_when_once(raw: str) -> datetime:
     )
     now = datetime.now(timezone.utc)
 
+    # через N минут
     if s.startswith("через "):
         parts = s.split()
         if len(parts) >= 2 and parts[1].isdigit():
             return now + timedelta(minutes=int(parts[1]))
 
+    # +N (минут)
     if s.startswith("+"):
         t = s[1:].strip().replace(" мин", "").strip()
         if t.isdigit():
             return now + timedelta(minutes=int(t))
 
+    # завтра HH:MM
     if s.startswith("завтра"):
         rest = s.replace("завтра", "").strip()
         if ":" in rest:
             hh, mm = rest.split(":")[:2]
             return (now + timedelta(days=1)).replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
 
+    # HH:MM (сегодня/завтра)
     if ":" in s:
         hh, mm = s.split(":")[:2]
         if hh.isdigit() and mm.isdigit():
@@ -104,23 +109,35 @@ def _parse_when_once(raw: str) -> datetime:
                 target += timedelta(days=1)
             return target
 
+    # дефолт: через 2 минуты
     return now + timedelta(minutes=2)
 
 def _parse_repeat_to_cron(raw: str) -> str:
+    """
+    'каждую минуту'      -> * * * * *
+    'каждые 2 минуты'    -> */2 * * * *
+    'ежедневно 14:30'    -> 30 14 * * *
+    'HH:MM'               -> 30 14 * * *
+    'cron: */5 * * * *'   -> */5 * * * *
+    """
     s = (raw or "").strip().lower()
 
+    # Явный cron
     if s.startswith("cron:"):
         return s.split("cron:", 1)[1].strip()
 
+    # Каждую минуту
     if s == "каждую минуту":
         return "* * * * *"
 
+    # Каждые N минут / минуты / минуту / мин
     m = re.match(r"^кажд(ый|ые)\s+(\d+)\s*(минут(у|ы)?|мин)\b", s)
     if m:
         n = int(m.group(2))
         n = max(1, min(59, n))
         return f"*/{n} * * * *"
 
+    # Ежедневно HH:MM
     if s.startswith("ежедневно"):
         rest = s.replace("ежедневно", "").strip()
         if ":" in rest:
@@ -128,11 +145,13 @@ def _parse_repeat_to_cron(raw: str) -> str:
             if hh.isdigit() and mm.isdigit():
                 return f"{int(mm)} {int(hh)} * * *"
 
+    # Просто HH:MM
     if ":" in s:
         hh, mm = s.split(":")[:2]
         if hh.isdigit() and mm.isdigit():
             return f"{int(mm)} {int(hh)} * * *"
 
+    # Бекап: каждую минуту
     return "* * * * *"
 
 def _cron_next_utc(expr: str) -> datetime:
@@ -289,7 +308,7 @@ async def cmd_list(m: types.Message):
     kb = _build_reminders_keyboard(rows)
     await m.answer(text, reply_markup=kb.as_markup())
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("rem:"))
+@dp.callback_query(F.data.startswith("rem:"))
 async def on_reminder_action(cb: CallbackQuery):
     try:
         _, action, rid = cb.data.split(":", 2)
@@ -315,7 +334,8 @@ async def on_reminder_action(cb: CallbackQuery):
 @app.post(f"/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    update = Update(**data)  # ✅ исправлено
+    # FIX: без model_validate — просто Pydantic-инициализация
+    update = Update(**data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
