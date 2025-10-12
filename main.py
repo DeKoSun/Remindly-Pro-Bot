@@ -334,11 +334,18 @@ async def on_reminder_action(cb: CallbackQuery):
 @app.post(f"/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    # FIX: без model_validate — просто Pydantic-инициализация
-    update = Update(**data)
+
+    # Совместимость Pydantic v1/v2
+    try:
+        # v2
+        update = Update.model_validate(data)  # type: ignore[attr-defined]
+    except AttributeError:
+        # v1
+        update = Update(**data)
+
     await dp.feed_update(bot, update)
     return {"ok": True}
-
+    
 @app.on_event("startup")
 async def on_startup():
     if _tourney:
