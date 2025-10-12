@@ -12,15 +12,12 @@ from aiogram.filters import Command
 from aiogram.types import (
     Update,
     BotCommand,
-    ChatMemberUpdated,
-    BotCommandScopeAllPrivateChats,
-    BotCommandScopeAllGroupChats,
     CallbackQuery,
+    BotCommandScopeAllPrivateChats,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-
 from croniter import croniter
 
 # ==== локальные модули ====
@@ -55,7 +52,7 @@ dp = Dispatcher()
 _tourney = TournamentScheduler(bot)
 _universal = UniversalReminderScheduler(bot)
 
-# ================== FSM: мастера добавления ==================
+# ================== FSM ==================
 class AddOnceSG(StatesGroup):
     text = State()
     when = State()
@@ -64,9 +61,8 @@ class AddRepeatSG(StatesGroup):
     text = State()
     sched = State()
 
-# =============== ВСПОМОГАТЕЛЬНОЕ =================
+# =============== Утилиты =================
 async def _ensure_user_chat(m: types.Message) -> None:
-    """Создаёт пользователя и чат в БД при первом взаимодействии."""
     try:
         if m.from_user:
             upsert_telegram_user(m.from_user.id)
@@ -111,14 +107,6 @@ def _parse_when_once(raw: str) -> datetime:
     return now + timedelta(minutes=2)
 
 def _parse_repeat_to_cron(raw: str) -> str:
-    """
-    Преобразует человеко-понятный ввод в CRON:
-    - 'каждую минуту' → '* * * * *'
-    - 'каждые N минут/минуты/мин' → '*/N * * * *'
-    - 'ежедневно HH:MM' → 'MM HH * * *'
-    - 'HH:MM' → ежедневно
-    - 'cron: <EXPR>' → как есть
-    """
     s = (raw or "").strip().lower()
 
     if s.startswith("cron:"):
@@ -130,10 +118,7 @@ def _parse_repeat_to_cron(raw: str) -> str:
     m = re.match(r"^кажд(ый|ые)\s+(\d+)\s*(минут(у|ы)?|мин)\b", s)
     if m:
         n = int(m.group(2))
-        if n < 1:
-            n = 1
-        if n > 59:
-            n = 59
+        n = max(1, min(59, n))
         return f"*/{n} * * * *"
 
     if s.startswith("ежедневно"):
@@ -164,7 +149,7 @@ def _fmt_utc(dt: datetime) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC)")
 
-# ========= Рендер списка с кнопками =========
+# ========= Вспомогательные для /list =========
 def _build_reminders_list_text(rows: list[dict]) -> str:
     if not rows:
         return "Пока нет напоминаний."
@@ -223,19 +208,6 @@ async def cmd_ping(m: types.Message):
     except Exception as e:
         await m.answer(f"pong ❌ | db error: <code>{e}</code>")
 
-# ---------- Турнирные ----------
-@dp.message(Command("subscribe_tournaments"))
-async def cmd_subscribe_tournaments(m: types.Message):
-    await _ensure_user_chat(m)
-    if m.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        return await m.answer("Эта команда только для групп.")
-    await m.answer("✅ Турнирные напоминания включены.")
-
-@dp.message(Command("unsubscribe_tournaments"))
-async def cmd_unsubscribe_tournaments(m: types.Message):
-    await _ensure_user_chat(m)
-    await m.answer("⏸ Турнирные напоминания выключены.")
-
 # ---------- Добавление одноразовых ----------
 @dp.message(Command("add"))
 async def add_once_start(m: types.Message, state: FSMContext):
@@ -245,14 +217,12 @@ async def add_once_start(m: types.Message, state: FSMContext):
 
 @dp.message(AddOnceSG.text)
 async def add_once_wait_when(m: types.Message, state: FSMContext):
-    await _ensure_user_chat(m)
     await state.update_data(text=m.text.strip())
     await state.set_state(AddOnceSG.when)
     await m.answer("⏰ Когда напомнить?\nПримеры: 14:30 · завтра 10:00 · через 25 минут · +15")
 
 @dp.message(AddOnceSG.when)
 async def add_once_finish(m: types.Message, state: FSMContext):
-    await _ensure_user_chat(m)
     data = await state.get_data()
     text = data.get("text", "").strip()
     when_raw = (m.text or "").strip()
@@ -271,7 +241,6 @@ async def add_once_finish(m: types.Message, state: FSMContext):
 # ---------- Повторяющиеся ----------
 @dp.message(Command("add_repeat"))
 async def add_repeat_start(m: types.Message, state: FSMContext):
-    await _ensure_user_chat(m)
     await state.set_state(AddRepeatSG.text)
     await m.answer("📝 Введи текст повторяющегося напоминания:")
 
@@ -303,20 +272,16 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
         next_at = _cron_next_utc(cron_expr)
     except Exception:
         return await m.answer(f"❌ Неверное расписание.\nexpr: <code>{cron_expr}</code>")
-    try:
-        add_recurring_reminder(m.from_user.id, m.chat.id, text, cron_expr, next_at)
-        await state.clear()
-        await m.answer(
-            "✅ Повторяющееся напоминание создано:\n"
-            f"<b>{text}</b>\n🔁 CRON: <code>{cron_expr}</code>\n🕒 Ближайшее: {_fmt_utc(next_at)}"
-        )
-    except Exception as e:
-        await m.answer(f"❌ DB insert failed: <code>{e}</code>")
+    add_recurring_reminder(m.from_user.id, m.chat.id, text, cron_expr, next_at)
+    await state.clear()
+    await m.answer(
+        "✅ Повторяющееся напоминание создано:\n"
+        f"<b>{text}</b>\n🔁 CRON: <code>{cron_expr}</code>\n🕒 Ближайшее: {_fmt_utc(next_at)}"
+    )
 
-# ---------- Список и кнопки ----------
+# ---------- Список ----------
 @dp.message(Command("list"))
 async def cmd_list(m: types.Message):
-    await _ensure_user_chat(m)
     rows = get_active_reminders_for_chat(m.chat.id, include_paused=True)
     if not rows:
         return await m.answer("Пока нет напоминаний.")
@@ -350,19 +315,10 @@ async def on_reminder_action(cb: CallbackQuery):
 @app.post(f"/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    update = Update.model_validate(data)
+    update = Update(**data)  # ✅ исправлено
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-@app.get("/")
-async def root():
-    return {"status": "up"}
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-# ---------- Startup ----------
 @app.on_event("startup")
 async def on_startup():
     if _tourney:
@@ -383,3 +339,11 @@ async def on_startup():
         ],
         scope=BotCommandScopeAllPrivateChats(),
     )
+
+@app.get("/")
+async def root():
+    return {"status": "up"}
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
