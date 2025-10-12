@@ -1,4 +1,4 @@
-# FILE: scheduler_core.py
+# scheduler_core.py
 import os
 import asyncio
 import logging
@@ -16,6 +16,7 @@ from texts import pick_phrase, TOURNAMENT_VARIANTS
 from db import get_tournament_subscribed_chats, get_conn
 
 logger = logging.getLogger("remindly")
+
 
 # =========================
 #   Турнирный планировщик

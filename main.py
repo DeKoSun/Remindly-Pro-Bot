@@ -124,6 +124,7 @@ def _parse_repeat_to_cron(raw: str) -> str:
     - 'каждую минуту' → '* * * * *'
     - 'ежедневно HH:MM' → 'MM HH * * *'
     - 'cron: <EXPR>' → <EXPR> как есть
+    - 'HH:MM' → ежедневно в это время
     """
     s = (raw or "").strip().lower()
     if s.startswith("cron:"):
@@ -154,6 +155,11 @@ def _cron_next_utc(expr: str) -> datetime:
     return croniter(expr, now).get_next(datetime)
 
 def _fmt_utc(dt: datetime) -> str:
+    if not isinstance(dt, datetime):
+        try:
+            dt = datetime.fromisoformat(str(dt))
+        except Exception:
+            return str(dt)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC)")
@@ -169,7 +175,7 @@ async def cmd_help(m: types.Message):
     await _ensure_user_chat(m)
     await m.answer(HELP_TEXT, disable_web_page_preview=True)
 
-@dp.message(Command("ping"))
+@dp.message(Command("ping")))
 async def cmd_ping(m: types.Message):
     """Быстрый health-check: БД и планировщики."""
     await _ensure_user_chat(m)
@@ -263,18 +269,36 @@ async def add_repeat_wait_sched(m: types.Message, state: FSMContext):
 async def add_repeat_finish(m: types.Message, state: FSMContext):
     await _ensure_user_chat(m)
     data = await state.get_data()
-    text = data.get("text", "").strip()
+    text = (data.get("text") or "").strip()
     sched_raw = (m.text or "").strip()
 
     if not text:
         await state.clear()
         return await m.answer("❌ Текст пустой. Попробуй ещё раз: /add_repeat")
 
+    # 1) Парсим в CRON и показываем, что получилось
+    cron_expr = _parse_repeat_to_cron(sched_raw)
+    is_valid = False
     try:
-        cron_expr = _parse_repeat_to_cron(sched_raw)
-        if not croniter.is_valid(cron_expr):
-            return await m.answer("❌ Неверный CRON. Пример: <code>*/5 * * * *</code> или напиши «каждую минуту».")
+        is_valid = croniter.is_valid(cron_expr)
+    except Exception as e:
+        # чтобы видеть редкие ошибки в croniter
+        return await m.answer(f"❌ croniter error: <code>{e}</code>\nexpr: <code>{cron_expr}</code>")
+
+    if not is_valid:
+        return await m.answer(
+            "❌ Неверное расписание.\n"
+            f"expr: <code>{cron_expr}</code>\n"
+            "Попробуй: «каждую минуту», «ежедневно HH:MM», «HH:MM» или «cron: */5 * * * *»."
+        )
+
+    # 2) Считаем next_at и пробуем вставить в БД. В ответ отдадим ПОЛНУЮ причину сбоя
+    try:
         next_at = _cron_next_utc(cron_expr)
+    except Exception as e:
+        return await m.answer(f"❌ Не удалось вычислить ближайшее время: <code>{e}</code>\nexpr: <code>{cron_expr}</code>")
+
+    try:
         _ = add_recurring_reminder(
             user_id=m.from_user.id,
             chat_id=m.chat.id,
@@ -283,15 +307,19 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
             next_at=next_at,
         )
         await state.clear()
-        await m.answer(
+        return await m.answer(
             "✅ Повторяющееся напоминание создано:\n"
             f"<b>{text}</b>\n"
             f"🔁 CRON: <code>{cron_expr}</code>\n"
             f"🕒 Ближайшее: {_fmt_utc(next_at)}"
         )
     except Exception as e:
-        logger.exception("add_repeat_finish error: %s", e)
-        await m.answer("❌ Не удалось создать повторяющееся. Проверь формат (можно cron: EXPR).")
+        # здесь хотим видеть реальную SQL-ошибку/ограничение/NULL-поле
+        return await m.answer(
+            "❌ DB insert failed.\n"
+            f"reason: <code>{e}</code>\n"
+            f"expr: <code>{cron_expr}</code>\nnext_at: <code>{_fmt_utc(next_at)}</code>"
+        )
 
 # ---------- Управление ----------
 @dp.message(Command("list"))
@@ -308,10 +336,8 @@ async def cmd_list(m: types.Message):
         remind_at = r.get("remind_at") if isinstance(r, dict) else None
         next_at = r.get("next_at") if isinstance(r, dict) else None
 
-        if kind == "once":
-            when_str = _fmt_utc(remind_at if isinstance(remind_at, datetime) else datetime.fromisoformat(str(remind_at)))
-        else:
-            when_str = _fmt_utc(next_at if isinstance(next_at, datetime) else datetime.fromisoformat(str(next_at)))
+        when_dt = remind_at if kind == "once" else next_at
+        when_str = _fmt_utc(when_dt)
 
         # ID показываем только здесь — чтобы было чем управлять:
         lines.append(f"• <code>{rid}</code> — {text} — {when_str} — {('🔁' if kind!='once' else '•')}")
@@ -321,7 +347,7 @@ async def cmd_list(m: types.Message):
 async def cmd_delete(m: types.Message):
     await _ensure_user_chat(m)
     parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
+    if len(parts) < 2 or not parts[1].strip():
         return await m.answer("Укажи ID: /delete <id>")
     rid = parts[1].strip()
     try:
@@ -335,7 +361,7 @@ async def cmd_delete(m: types.Message):
 async def cmd_pause(m: types.Message):
     await _ensure_user_chat(m)
     parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
+    if len(parts) < 2 or not parts[1].strip():
         return await m.answer("Укажи ID: /pause <id>")
     rid = parts[1].strip()
     try:
@@ -349,7 +375,7 @@ async def cmd_pause(m: types.Message):
 async def cmd_resume(m: types.Message):
     await _ensure_user_chat(m)
     parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
+    if len(parts) < 2 or not parts[1].strip():
         return await m.answer("Укажи ID: /resume <id>")
     rid = parts[1].strip()
     try:
