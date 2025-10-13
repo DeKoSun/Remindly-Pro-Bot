@@ -34,7 +34,7 @@ from db import (
     set_paused,
 )
 
-# ================== Конфигурация ==================
+# ------------------ Конфигурация ------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "webhook")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
@@ -43,6 +43,7 @@ if not BOT_TOKEN or not PUBLIC_BASE_URL:
     raise RuntimeError("TELEGRAM_BOT_TOKEN and PUBLIC_BASE_URL must be set")
 
 def _default_props():
+    # aiogram v3 допускает как model_validate(v2), так и __init__ (старые ветки)
     try:
         return DefaultBotProperties.model_validate({"parse_mode": ParseMode.HTML})
     except AttributeError:
@@ -51,14 +52,16 @@ def _default_props():
 bot = Bot(BOT_TOKEN, default=_default_props())
 dp = Dispatcher()
 
+# Планировщики
 _tourney = TournamentScheduler(bot)
-_universal = UniversalReminderScheduler(bot, poll_interval_sec=30)
+_universal = UniversalReminderScheduler(bot, poll_interval_sec=30)  # 30 сек — как просили
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Корректно закрываем aiohttp-сессию бота при остановке FastAPI
         await bot.session.close()
 
 app = FastAPI(lifespan=lifespan)
@@ -66,7 +69,7 @@ app = FastAPI(lifespan=lifespan)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("remindly")
 
-# ================== FSM ==================
+# ------------------ FSM ------------------
 class AddOnceSG(StatesGroup):
     text = State()
     when = State()
@@ -75,8 +78,9 @@ class AddRepeatSG(StatesGroup):
     text = State()
     sched = State()
 
-# =============== Утилиты =================
+# ------------------ Вспомогательное ------------------
 async def _ensure_user_chat(m: types.Message) -> None:
+    """Гарантируем наличие записей о пользователе и чате в БД."""
     try:
         if m.from_user:
             upsert_telegram_user(m.from_user.id)
@@ -85,6 +89,13 @@ async def _ensure_user_chat(m: types.Message) -> None:
         logger.exception("ensure_user_chat failed: %s", e)
 
 def _parse_when_once(raw: str) -> datetime:
+    """
+    Поддержка:
+      - 'через N минут', '+N', '+N мин'
+      - 'завтра HH:MM'
+      - 'HH:MM' (если время уже прошло — на завтра)
+      - иначе: now + 2 минуты (дефолт)
+    """
     s = (raw or "").strip().lower()
     now = datetime.now(timezone.utc)
 
@@ -117,6 +128,14 @@ def _parse_when_once(raw: str) -> datetime:
     return now + timedelta(minutes=2)
 
 def _parse_repeat_to_cron(raw: str) -> str:
+    """
+    Поддержка:
+      - 'cron: */5 * * * *'
+      - 'каждую минуту'
+      - 'каждые N минут'
+      - 'ежедневно HH:MM'
+      - 'HH:MM'
+    """
     s = (raw or "").strip().lower()
     if s.startswith("cron:"):
         return s.split("cron:", 1)[1].strip()
@@ -139,12 +158,14 @@ def _parse_repeat_to_cron(raw: str) -> str:
         hh, mm = s.split(":", 1)
         return f"{int(mm)} {int(hh)} * * *"
 
+    # дефолт — каждую минуту
     return "* * * * *"
 
 def _cron_next_utc(expr: str) -> datetime:
     return croniter(expr, datetime.now(timezone.utc)).get_next(datetime)
 
 def _fmt_utc(dt: datetime) -> str:
+    """Красивое UTC-время для сообщений."""
     if not isinstance(dt, datetime):
         try:
             dt = datetime.fromisoformat(str(dt))
@@ -155,6 +176,7 @@ def _fmt_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC)")
 
 def _build_reminders_list_text(rows: list[dict]) -> str:
+    """Формирование текста списка с эмодзи/статусами."""
     if not rows:
         return MSG["list_empty"]
     lines = [MSG["list_header"]]
@@ -191,7 +213,7 @@ async def _refresh_list_message(chat_id: int, message: types.Message):
     except Exception:
         await message.answer(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
 
-# ================== ХЕНДЛЕРЫ ==================
+# ------------------ Команды ------------------
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     await _ensure_user_chat(m)
@@ -213,10 +235,6 @@ async def cmd_ping(m: types.Message):
         await m.answer(str(MSG["pong_db_err"](e)))
 
 # -------- /add (одноразовое) --------
-class AddOnceSG(StatesGroup):
-    text = State()
-    when = State()
-
 @dp.message(Command("add"))
 async def add_once_start(m: types.Message, state: FSMContext):
     await _ensure_user_chat(m)
@@ -250,10 +268,6 @@ async def add_once_finish(m: types.Message, state: FSMContext):
         await state.clear()
 
 # -------- /add_repeat (повторяющееся) --------
-class AddRepeatSG(StatesGroup):
-    text = State()
-    sched = State()
-
 @dp.message(Command("add_repeat"))
 async def add_repeat_start(m: types.Message, state: FSMContext):
     await _ensure_user_chat(m)
@@ -287,7 +301,7 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
     finally:
         await state.clear()
 
-# -------- /list (список + кнопки) --------
+# -------- /list (кнопки) --------
 @dp.message(Command("list"))
 async def cmd_list(m: types.Message):
     await _ensure_user_chat(m)
@@ -296,7 +310,7 @@ async def cmd_list(m: types.Message):
     kb = _build_reminders_keyboard(rows)
     await m.answer(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
 
-# -------- Колбэки: пауза / возобновить / удалить --------
+# -------- Callback: pause/resume/delete --------
 @dp.callback_query(F.data.startswith("rem:"))
 async def cb_reminders(cq: CallbackQuery):
     try:
@@ -322,51 +336,45 @@ async def cb_reminders(cq: CallbackQuery):
     except Exception as e:
         await cq.answer(f"Ошибка: {e}", show_alert=True)
 
-# ---------- Webhook ----------
+# ------------------ Webhook ------------------
 @app.post(f"/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
     data = await request.json()
+    # Совместимость pydantic v2/v1
     try:
-        update = Update.model_validate(data)        # Pydantic v2
+        update = Update.model_validate(data)        # v2
     except AttributeError:
         try:
-            update = Update.parse_obj(data)         # Pydantic v1
+            update = Update.parse_obj(data)         # v1
         except AttributeError:
-            update = Update(**data)                 # fallback
+            update = Update(**data)                 # крайний случай
     await dp.feed_update(bot, update)
     return {"ok": True}
 
 @app.on_event("startup")
 async def on_startup():
+    # Запускаем планировщики
     if _tourney:
         _tourney.start()
     if _universal:
         _universal.start()
 
+    # Регистрируем веб-хук
     await bot.set_webhook(
         url=f"{PUBLIC_BASE_URL}/{WEBHOOK_SECRET}",
         drop_pending_updates=True,
     )
-    await bot.set_my_commands(
-        [
-            BotCommand("help", "Справка по командам ℹ️"),
-            BotCommand("add", "Создать разовое 📝"),
-            BotCommand("add_repeat", "Создать повторяющееся 🔁"),
-            BotCommand("list", "Список с кнопками 📋"),
-            BotCommand("ping", "Проверка состояния 🏓"),
-        ],
-        scope=BotCommandScopeAllPrivateChats(),
-    )
-    await bot.set_my_commands(
-        [
-            BotCommand("help", "Справка по командам ℹ️"),
-            BotCommand("add", "Создать разовое 📝"),
-            BotCommand("add_repeat", "Создать повторяющееся 🔁"),
-            BotCommand("list", "Список с кнопками 📋"),
-            BotCommand("ping", "Проверка состояния 🏓"),
-        ],
-        scope=BotCommandScopeAllGroupChats(),
-    )
+
+    # Команды (приват/группы)
+    commands = [
+        BotCommand("help", "Справка по командам ℹ️"),
+        BotCommand("add", "Создать разовое 📝"),
+        BotCommand("add_repeat", "Создать повторяющееся 🔁"),
+        BotCommand("list", "Список с кнопками 📋"),
+        BotCommand("ping", "Проверка состояния 🏓"),
+    ]
+    await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    await bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
 
 @app.get("/")
 async def root():

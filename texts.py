@@ -75,7 +75,7 @@ MSG: dict[str, str | Callable[..., str]] = {
         f"{E['ok']} Напоминание создано:\n<b>{html.escape(txt)}</b>\n"
         f"{E['clock']} {when_utc}"
     ),
-    "enter_text_repeat": f"{E['spark']} Введи текст <b>повторяющегося</b> напоминания:",
+    "enter_text_repeat": f"{E['spark']} Введи текст повторяющегося напоминания:",
     "when_repeat": (
         f"{E['clock']} Какое расписание?\n"
         "• <b>каждую минуту</b>\n"

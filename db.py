@@ -1,3 +1,4 @@
+# db.py
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -18,7 +19,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 # HTTP-клиент (сервисный ключ обходит RLS)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Прямое подключение в Postgres (используйте Transaction Pooler: порт 6543, sslmode=require)
+# Прямое подключение в Postgres (Railway/Supabase: используйте transaction pooler)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
@@ -36,7 +37,7 @@ def get_conn():
 # ========= HELPERS =========
 
 def _iso(dt: datetime) -> str:
-    """Возврат UTC ISO8601."""
+    """UTC ISO8601 для timestamptz."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
@@ -65,7 +66,7 @@ def normalize_cron(expr: str) -> str:
       - 'каждую минуту'         -> '* * * * *'
       - 'ежедневно HH:MM'       -> 'MM HH * * *'
       - 'HH:MM'                  -> 'MM HH * * *'
-      - иначе — возвращаем как есть.
+      - иное — вернуть как есть.
     """
     s = (expr or "").strip().lower()
     if s == "каждую минуту":
@@ -87,6 +88,7 @@ def normalize_cron(expr: str) -> str:
 
 
 def validate_cron(expr: str) -> bool:
+    """Быстрая валидация cron-строки."""
     try:
         croniter(expr, datetime.now(timezone.utc)).get_next(datetime)
         return True
@@ -94,7 +96,7 @@ def validate_cron(expr: str) -> bool:
         return False
 
 
-# ========= Родительские строки для FK =========
+# ========= Родительские строки для FK / RLS =========
 
 def upsert_telegram_user(user_id: int):
     if not _table_exists("telegram_users"):
@@ -146,6 +148,7 @@ def set_tournament_subscription(chat_id: int, value: bool, user_id: Optional[int
     upsert_telegram_chat(chat_id)
 
     if _table_exists("tournament_subscribers"):
+        # если нет user_id — складываем как 0 (групповая подписка)
         if user_id is None:
             user_id = 0
         if value:
@@ -155,8 +158,8 @@ def set_tournament_subscription(chat_id: int, value: bool, user_id: Optional[int
                 "subscribed_at": _iso(datetime.now(timezone.utc)),
             }).execute()
         else:
-            supabase.table("tournament_subscribers") \
-                .delete().eq("chat_id", chat_id).eq("user_id", user_id).execute()
+            supabase.table("tournament_subscribers").delete() \
+                .eq("chat_id", chat_id).eq("user_id", user_id).execute()
     elif _table_exists("chats"):
         with get_conn() as c:
             cur = c.cursor()
@@ -167,7 +170,7 @@ def set_tournament_subscription(chat_id: int, value: bool, user_id: Optional[int
             c.commit()
 
 
-def get_tournament_subscribed_chats():
+def get_tournament_subscribed_chats() -> List[Tuple[int, Optional[str]]]:
     if _table_exists("tournament_subscribers"):
         rows = supabase.table("tournament_subscribers").select("chat_id").execute().data or []
         return [(r["chat_id"], None) for r in rows]
@@ -182,10 +185,9 @@ def get_tournament_subscribed_chats():
 
 # ========= Напоминания =========
 # public.reminders:
-#   id uuid PK, user_id bigint (FK -> telegram_users.user_id)
-#   chat_id bigint (FK -> telegram_chats.chat_id)
-#   text text, kind text ('once'|'cron')
-#   remind_at timestamptz, cron_expr text, next_at timestamptz
+#   id uuid PK, user_id bigint, chat_id bigint,
+#   text text, kind text ('once'|'cron'),
+#   remind_at timestamptz, cron_expr text, next_at timestamptz,
 #   paused bool, created_by bigint, created_at timestamptz, updated_at timestamptz
 
 def add_reminder(
@@ -223,6 +225,7 @@ def add_recurring_reminder(
 ) -> Dict[str, Any]:
     """Повторяющееся напоминание (cron)."""
     ensure_parent_rows(user_id, chat_id)
+
     cron_expr = normalize_cron(cron_expr)
     try:
         if next_at is None:
@@ -258,7 +261,12 @@ def get_active_reminders(user_id: int):
 
 
 def get_active_reminders_for_chat(chat_id: int, *, include_paused: bool = True) -> List[dict]:
-    """Список напоминаний для чата (для отображения пользователю с нумерацией)."""
+    """
+    Список напоминаний для чата:
+      1) по remind_at (сначала те, у кого есть дата),
+      2) затем по next_at,
+      3) затем по created_at.
+    """
     q = (
         supabase.table("reminders")
         .select("*")
@@ -314,7 +322,10 @@ def update_remind_at(reminder_id: str, when_utc_dt: datetime):
 
 def get_due_once_and_recurring(window_minutes: int = 10) -> Tuple[List[dict], List[dict]]:
     """
-    Возвращает (once_list, cron_list) для окна догонки window_minutes.
+    Возвращает два списка для обработчика планировщика:
+      - once: напоминания, у которых remind_at ∈ [now - window; now]
+      - cron:   напоминания, у которых next_at   ∈ [now - window; now]
+    Это позволяет «догонять» процесс при рестарте.
     """
     now = datetime.now(timezone.utc)
     win = now - timedelta(minutes=window_minutes)
@@ -328,21 +339,27 @@ def get_due_once_and_recurring(window_minutes: int = 10) -> Tuple[List[dict], Li
         .eq("paused", False)
         .lte("remind_at", now_iso)
         .gte("remind_at", win_iso)
-        .execute().data or []
+        .execute()
+        .data
+        or []
     )
-    cron = (
+
+    cron_list = (
         supabase.table("reminders")
         .select("*")
         .eq("kind", "cron")
         .eq("paused", False)
         .lte("next_at", now_iso)
         .gte("next_at", win_iso)
-        .execute().data or []
+        .execute()
+        .data
+        or []
     )
-    return once, cron
+    return once, cron_list
 
 
 def advance_recurring(reminder_id: str, cron_expr: str):
+    """Продвинуть cron вперёд на один шаг от «сейчас»."""
     nxt = croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime)
     return supabase.table("reminders").update({
         "next_at": _iso(nxt),
@@ -405,6 +422,7 @@ def list_roles(chat_id: int):
 # ========= DEBUG =========
 
 def dbg_insert_once(user_id: int, chat_id: int, minutes: int = 1, text: Optional[str] = None):
+    """Быстрый helper для тестов: one-off через N минут."""
     ensure_parent_rows(user_id, chat_id)
     when = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     if not text:
