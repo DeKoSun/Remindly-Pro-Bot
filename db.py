@@ -3,6 +3,7 @@ import os
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Union, List, Any, Dict
+import re
 
 import psycopg2
 import psycopg2.extras
@@ -19,7 +20,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 # HTTP-клиент (сервисный ключ обходит RLS)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Прямое подключение в Postgres (Railway/Supabase: используйте transaction pooler)
+# Прямое подключение к Postgres
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
@@ -60,17 +61,35 @@ def _table_exists(name: str) -> bool:
 
 # ========= CRON нормализация/валидация =========
 
+_every_min_re = re.compile(r"^каждые?\s+(\d{1,2})\s*мин(ут|уты|ута|)$", re.IGNORECASE)
+_every_hour_re = re.compile(r"^каждые?\s+(\d{1,2})\s*час(ов|а|)$", re.IGNORECASE)
+
 def normalize_cron(expr: str) -> str:
     """
     Поддержка «человечных» шаблонов:
-      - 'каждую минуту'         -> '* * * * *'
-      - 'ежедневно HH:MM'       -> 'MM HH * * *'
-      - 'HH:MM'                  -> 'MM HH * * *'
-      - иное — вернуть как есть.
+      - 'каждую минуту'              -> '* * * * *'
+      - 'каждые N минут(ы/у/)'       -> '*/N * * * *'     (1..59)
+      - 'каждые N час(ов/а/)'        -> '0 */N * * *'     (1..23)
+      - 'ежедневно HH:MM'            -> 'MM HH * * *'
+      - 'HH:MM'                       -> 'MM HH * * *'
+      - иначе — вернуть как есть.
     """
     s = (expr or "").strip().lower()
+
     if s == "каждую минуту":
         return "* * * * *"
+
+    m = _every_min_re.match(s)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 59:
+            return f"*/{n} * * * *"
+
+    m = _every_hour_re.match(s)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 23:
+            return f"0 */{n} * * *"
 
     if s.startswith("ежедневно"):
         s = s.replace("ежедневно", "", 1).strip()
@@ -84,6 +103,7 @@ def normalize_cron(expr: str) -> str:
                 return f"{mm} {hh} * * *"
         except Exception:
             pass
+
     return expr
 
 
@@ -227,9 +247,14 @@ def add_recurring_reminder(
     ensure_parent_rows(user_id, chat_id)
 
     cron_expr = normalize_cron(cron_expr)
+    # валидация: если невалидный cron — не записываем, чтобы не «ломать» шедулер
     try:
+        base = datetime.now(timezone.utc)
         if next_at is None:
-            next_at = croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime)
+            next_at = croniter(cron_expr, base).get_next(datetime)
+        else:
+            # если next_at задан вручную — всё равно убедимся, что cron валиден
+            croniter(cron_expr, base).get_next(datetime)
     except (CroniterBadCronError, ValueError):
         raise ValueError("Bad cron expression")
 
@@ -325,7 +350,7 @@ def get_due_once_and_recurring(window_minutes: int = 10) -> Tuple[List[dict], Li
     Возвращает два списка для обработчика планировщика:
       - once: напоминания, у которых remind_at ∈ [now - window; now]
       - cron:   напоминания, у которых next_at   ∈ [now - window; now]
-    Это позволяет «догонять» процесс при рестарте.
+    Это помогает «догонять» события после рестарта.
     """
     now = datetime.now(timezone.utc)
     win = now - timedelta(minutes=window_minutes)
