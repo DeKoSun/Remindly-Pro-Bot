@@ -2,7 +2,7 @@
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Tuple, Union, List, Any, Dict
 
 import psycopg2
 import psycopg2.extras
@@ -20,7 +20,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 # HTTP-клиент (сервисный ключ обходит RLS)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Прямое подключение в Postgres (используй Transaction Pooler: порт 6543, sslmode=require)
+# Прямое подключение в Postgres (используйте Transaction Pooler: порт 6543, sslmode=require)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
@@ -38,6 +38,7 @@ def get_conn():
 # ========= HELPERS =========
 
 def _iso(dt: datetime) -> str:
+    """UTC ISO8601."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
@@ -49,9 +50,9 @@ def _table_exists(name: str) -> bool:
         cur.execute(
             """
             select 1
-            from information_schema.tables
-            where table_schema = 'public' and table_name = %s
-            limit 1
+              from information_schema.tables
+             where table_schema = 'public' and table_name = %s
+             limit 1
             """,
             (name,),
         )
@@ -189,19 +190,28 @@ def get_tournament_subscribed_chats():
 #   remind_at timestamptz, cron_expr text, next_at timestamptz
 #   paused bool, created_by bigint, created_at timestamptz, updated_at timestamptz
 
-def add_reminder(user_id: int, chat_id: int, text: str, remind_at: datetime):
+def add_reminder(
+    user_id: int,
+    chat_id: int,
+    text: str,
+    remind_at: datetime,
+    *,
+    created_by: Optional[int] = None,  # ← терпим вызовы с этим именованным параметром
+) -> Dict[str, Any]:
     """Одноразовое напоминание."""
     ensure_parent_rows(user_id, chat_id)
-    return supabase.table("reminders").insert({
+    creator = created_by or user_id
+    res = supabase.table("reminders").insert({
         "user_id": user_id,
         "chat_id": chat_id,
         "text": text,
         "kind": "once",
         "remind_at": _iso(remind_at),
         "paused": False,
-        "created_by": user_id,
+        "created_by": creator,
         "created_at": _iso(datetime.now(timezone.utc)),
     }).execute()
+    return (res.data or [{}])[0]
 
 
 def add_recurring_reminder(
@@ -211,7 +221,8 @@ def add_recurring_reminder(
     cron_expr: str,
     *,
     next_at: Optional[datetime] = None,
-) -> dict:
+    created_by: Optional[int] = None,  # ← и здесь тоже
+) -> Dict[str, Any]:
     """Повторяющееся напоминание (cron)."""
     ensure_parent_rows(user_id, chat_id)
     cron_expr = normalize_cron(cron_expr)
@@ -221,6 +232,7 @@ def add_recurring_reminder(
     except (CroniterBadCronError, ValueError):
         raise ValueError("Bad cron expression")
 
+    creator = created_by or user_id
     res = supabase.table("reminders").insert({
         "user_id": user_id,
         "chat_id": chat_id,
@@ -229,10 +241,10 @@ def add_recurring_reminder(
         "cron_expr": cron_expr,
         "next_at": _iso(next_at),
         "paused": False,
-        "created_by": user_id,
+        "created_by": creator,
         "created_at": _iso(datetime.now(timezone.utc)),
     }).execute()
-    return res.data[0] if res.data else {}
+    return (res.data or [{}])[0]
 
 
 def get_active_reminders(user_id: int):
@@ -303,7 +315,7 @@ def update_remind_at(reminder_id: str, when_utc_dt: datetime):
     }).eq("id", reminder_id).execute()
 
 
-def get_due_once_and_recurring(window_minutes: int = 10) -> Tuple[list, list]:
+def get_due_once_and_recurring(window_minutes: int = 10) -> Tuple[List[dict], List[dict]]:
     """
     Возвращает (once_list, cron_list) для окна догонки window_minutes.
     """
@@ -410,7 +422,7 @@ def dbg_insert_once(user_id: int, chat_id: int, minutes: int = 1, text: Optional
         "created_by": user_id,
         "created_at": _iso(datetime.now(timezone.utc)),
     }).execute()
-    return res.data[0] if res.data else None
+    return (res.data or [{}])[0]
 
 
 # ========= HIGH-LEVEL «по номеру или по UUID» =========
@@ -424,14 +436,14 @@ def resolve_selector_to_id(chat_id: int, selector: Selector, user_id: Optional[i
       - порядковому номеру (1..N) в списке напоминаний чата (сначала ближайшие).
     Если user_id указан — дополнительно фильтруем по автору (created_by).
     """
-    # Если это UUID — попробуем взять как есть
+    # UUID?
     if isinstance(selector, str) and "-" in selector:
         row = get_reminder_by_id(selector)
         if row and row.get("chat_id") == chat_id and (user_id is None or row.get("created_by") == user_id):
             return row["id"]
         return None
 
-    # Иначе — индекс
+    # Индекс?
     try:
         idx = int(selector)
     except Exception:
