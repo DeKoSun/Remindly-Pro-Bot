@@ -21,7 +21,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from croniter import croniter
 
-# ==== локальные модули ====
+# ===== локальные модули =====
 from scheduler_core import TournamentScheduler, UniversalReminderScheduler
 from texts import HELP_TEXT
 from db import (
@@ -44,10 +44,10 @@ if not BOT_TOKEN or not PUBLIC_BASE_URL:
     raise RuntimeError("TELEGRAM_BOT_TOKEN and PUBLIC_BASE_URL must be set")
 
 # ---------- безопасное создание бота ----------
-def make_default_props():
+def _default_props():
     """
     Aiogram 3 использует Pydantic. В v2 есть model_validate, в v1 — обычный конструктор.
-    Этот хелпер делает создание совместимым и устраняет ошибку BaseModel.__init__().
+    Этот хелпер делает создание совместимым и убирает BaseModel.__init__() ошибки.
     """
     try:
         # Pydantic v2
@@ -56,7 +56,7 @@ def make_default_props():
         # Pydantic v1
         return DefaultBotProperties(parse_mode=ParseMode.HTML)
 
-bot = Bot(BOT_TOKEN, default=make_default_props())
+bot = Bot(BOT_TOKEN, default=_default_props())
 dp = Dispatcher()
 
 _tourney = TournamentScheduler(bot)
@@ -96,8 +96,8 @@ async def _ensure_user_chat(m: types.Message) -> None:
 
 def _parse_when_once(raw: str) -> datetime:
     """
-    Поддерживаем: "через 5", "+10", "HH:MM", "завтра HH:MM".
-    Возвращаем UTC datetime (сейчас + 2 мин по умолчанию).
+    Поддерживаем: «через N», «+N», «HH:MM», «завтра HH:MM».
+    Возвращаем UTC datetime (по умолчанию сейчас + 2 мин).
     """
     s = (raw or "").strip().lower()
     now = datetime.now(timezone.utc)
@@ -123,7 +123,7 @@ def _parse_when_once(raw: str) -> datetime:
                 hour=int(hh), minute=int(mm), second=0, microsecond=0
             )
 
-    # "14:30" (если время уже прошло — на завтра)
+    # "14:30" (если время прошло — на завтра)
     if ":" in s:
         hh, mm = s.split(":", 1)
         if hh.isdigit() and mm.isdigit():
@@ -137,11 +137,11 @@ def _parse_when_once(raw: str) -> datetime:
 def _parse_repeat_to_cron(raw: str) -> str:
     """
     Поддерживаем:
-     - "cron: */5 * * * *"
-     - "каждую минуту"
-     - "каждые N минут", "каждые 2 мин", "каждые 2 минуты"
-     - "ежедневно HH:MM"
-     - "HH:MM" (ежедневно)
+     • "cron: */5 * * * *"
+     • "каждую минуту"
+     • "каждые N минут/мин/минуты"
+     • "ежедневно HH:MM"
+     • "HH:MM" (ежедневно)
     """
     s = (raw or "").strip().lower()
     if s.startswith("cron:"):
@@ -187,8 +187,8 @@ def _fmt_utc(dt: datetime) -> str:
 # ========= вспомогательные для /list =========
 def _build_reminders_list_text(rows: list[dict]) -> str:
     if not rows:
-        return "Пока нет напоминаний."
-    lines = ["<b>Напоминания этого чата:</b>"]
+        return "📭 Пока нет напоминаний."
+    lines = ["<b>🧾 Напоминания этого чата:</b>"]
     for idx, r in enumerate(rows, start=1):
         text = r.get("text", "—")
         kind = r.get("kind") or "once"
@@ -226,7 +226,7 @@ async def _refresh_list_message(chat_id: int, message: types.Message):
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     await _ensure_user_chat(m)
-    await m.answer("Привет! Напиши /help, чтобы увидеть мои команды.")
+    await m.answer("👋 Привет! Напиши /help, чтобы увидеть мои команды.")
 
 @dp.message(Command("help"))
 async def cmd_help(m: types.Message):
@@ -239,22 +239,22 @@ async def cmd_ping(m: types.Message):
     try:
         _ = get_active_reminders(m.from_user.id)
         sched = "ok" if (_tourney and _universal) else "no"
-        await m.answer(f"pong ✅ | db=ok | sched={sched}")
+        await m.answer(f"🏓 pong — ✅ db=ok | 🗓 sched={sched}")
     except Exception as e:
-        await m.answer(f"pong ❌ | db error: <code>{e}</code>")
+        await m.answer(f"🏓 pong — ❌ db error: <code>{e}</code>")
 
 # -------- /add (одноразовое) --------
 @dp.message(Command("add"))
 async def add_once_start(m: types.Message, state: FSMContext):
     await _ensure_user_chat(m)
     await state.set_state(AddOnceSG.text)
-    await m.answer("Введи текст напоминания:")
+    await m.answer("📝 Введи текст напоминания:")
 
 @dp.message(AddOnceSG.text, F.text)
 async def add_once_text(m: types.Message, state: FSMContext):
     await state.update_data(text=m.text.strip())
     await state.set_state(AddOnceSG.when)
-    await m.answer("Когда напомнить?\nПримеры: 14:30 · завтра 10:00 · через 25 · +15")
+    await m.answer("⏰ Когда напомнить?\nПримеры: <b>14:30</b> · <b>завтра 10:00</b> · <b>через 25</b> · <b>+15</b>")
 
 @dp.message(AddOnceSG.when, F.text)
 async def add_once_finish(m: types.Message, state: FSMContext):
@@ -269,9 +269,8 @@ async def add_once_finish(m: types.Message, state: FSMContext):
             chat_id=m.chat.id,
             text=text,
             remind_at=when,
-            created_by=m.from_user.id,
         )
-        await m.answer(f"✅ Напоминание создано:\n<b>{text}</b>\n🕒 {_fmt_utc(row['remind_at'])}")
+        await m.answer(f"✅ Напоминание создано:\n<b>{text}</b>\n🕒 {_fmt_utc(row.get('remind_at', when))}")
     except Exception as e:
         await m.answer(f"❌ Не удалось создать. Причина: <code>{e}</code>")
     finally:
@@ -282,19 +281,19 @@ async def add_once_finish(m: types.Message, state: FSMContext):
 async def add_repeat_start(m: types.Message, state: FSMContext):
     await _ensure_user_chat(m)
     await state.set_state(AddRepeatSG.text)
-    await m.answer("Введи текст повторяющегося напоминания:")
+    await m.answer("📝 Введи текст <b>повторяющегося</b> напоминания:")
 
 @dp.message(AddRepeatSG.text, F.text)
 async def add_repeat_text(m: types.Message, state: FSMContext):
     await state.update_data(text=m.text.strip())
     await state.set_state(AddRepeatSG.sched)
     await m.answer(
-        "Какое расписание?\n"
-        "• каждую минуту\n"
-        "• каждые N минут\n"
-        "• ежедневно HH:MM\n"
-        "• HH:MM (тоже ежедневно)\n"
-        "• cron: * * * * * (любой CRON)"
+        "⏱ Какое расписание?\n"
+        "• <b>каждую минуту</b>\n"
+        "• <b>каждые N минут</b>\n"
+        "• <b>ежедневно HH:MM</b>\n"
+        "• <b>HH:MM</b> (тоже ежедневно)\n"
+        "• <b>cron: * * * * *</b> (любой CRON)"
     )
 
 @dp.message(AddRepeatSG.sched, F.text)
@@ -305,7 +304,7 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
     expr = _parse_repeat_to_cron(m.text)
 
     try:
-        # валидируем cron и сразу считаем next_at
+        # валидируем cron и сразу считаем next_at для вывода пользователю
         next_at = _cron_next_utc(expr)
 
         row = add_recurring_reminder(
@@ -313,8 +312,6 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
             chat_id=m.chat.id,
             text=text,
             cron_expr=expr,
-            next_at=next_at,
-            created_by=m.from_user.id,
         )
         await m.answer(
             "✅ Повторяющееся напоминание создано:\n"
@@ -324,7 +321,7 @@ async def add_repeat_finish(m: types.Message, state: FSMContext):
         )
     except Exception as e:
         await m.answer(
-            "❌ Не удалось создать повторяющееся. Проверь формат (можно cron: EXPR).\n"
+            "❌ Не удалось создать повторяющееся. Проверь формат (можно <code>cron: EXPR</code>).\n"
             f"<code>{e}</code>"
         )
     finally:
@@ -350,13 +347,13 @@ async def cb_reminders(cq: CallbackQuery):
     try:
         if action == "pause":
             set_paused(rid, True)
-            await cq.answer("Поставлено на паузу")
+            await cq.answer("⏸ Поставлено на паузу")
         elif action == "resume":
             set_paused(rid, False)
-            await cq.answer("Возобновлено")
+            await cq.answer("▶️ Возобновлено")
         elif action == "delete":
             delete_reminder_by_id(rid)
-            await cq.answer("Удалено")
+            await cq.answer("🗑 Удалено")
         else:
             return await cq.answer("Неизвестное действие", show_alert=True)
 
@@ -377,7 +374,7 @@ async def telegram_webhook(request: Request):
         try:
             update = Update.parse_obj(data)         # Pydantic v1
         except AttributeError:
-            update = Update(**data)                 # крайний fallback
+            update = Update(**data)                 # fallback
     await dp.feed_update(bot, update)
     return {"ok": True}
 
@@ -397,11 +394,11 @@ async def on_startup():
     # команды
     await bot.set_my_commands(
         [
-            BotCommand("help", "Показать команды"),
-            BotCommand("add", "Создать разовое напоминание"),
-            BotCommand("add_repeat", "Создать повторяющееся"),
-            BotCommand("list", "Список с кнопками"),
-            BotCommand("ping", "Проверка состояния"),
+            BotCommand("help", "Справка по командам"),
+            BotCommand("add", "Создать разовое 📝"),
+            BotCommand("add_repeat", "Создать повторяющееся 🔁"),
+            BotCommand("list", "Список с кнопками 🧾"),
+            BotCommand("ping", "Проверка состояния 🏓"),
         ],
         scope=BotCommandScopeAllPrivateChats(),
     )

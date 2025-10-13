@@ -56,7 +56,7 @@ class TournamentScheduler:
         self.scheduler = AsyncIOScheduler(
             jobstores={"default": MemoryJobStore()},
             executors={"default": AsyncIOExecutor()},
-            job_defaults={"misfire_grace_time": 86400},
+            job_defaults={"misfire_grace_time": 86400},  # 24h
             timezone=pytz.timezone(DEFAULT_TZ),
         )
 
@@ -109,6 +109,7 @@ class UniversalReminderScheduler:
     """
     Фоновый поллер БД: берёт «просроченные» одноразовые/повторяющиеся напоминания
     и отправляет сообщения. Для повторяющихся рассчитывает следующее next_at.
+
     Ожидаемые колонки в public.reminders:
       id (uuid PK), user_id int8, chat_id int8, text text,
       paused bool default false, created_at timestamptz default now(),
@@ -252,7 +253,7 @@ class UniversalReminderScheduler:
                 # 1) Проставим next_at там, где он пустой у повторов
                 self._backfill_next_at_for_active_repeats(now_utc)
 
-                # 2) Забираем due-напоминания (сравнение с параметром now_utc)
+                # 2) Забираем due-напоминания
                 with get_conn() as c:
                     cur = c.cursor()
                     cur.execute(
@@ -269,12 +270,10 @@ class UniversalReminderScheduler:
                     )
                     rows = cur.fetchall()
 
-                # 3) Отправляем пользователю
+                # 3) Отправляем пользователю (только человекочитаемый текст)
                 for row in rows:
-                    # row как tuple (с psycopg2 без DictCursor); индексы строго по SELECT
                     rid, chat_id, text, kind, cron_expr, remind_at, next_at = row
                     try:
-                        # В сообщении — только человекочитаемый текст
                         await self.bot.send_message(chat_id, f"⏰ Напоминание: <b>{text}</b>")
                         logger.info("sent reminder id=%s chat_id=%s", rid, chat_id)
                     except Exception as e:
@@ -286,10 +285,8 @@ class UniversalReminderScheduler:
                             cur2 = c2.cursor()
                             k = (kind or "").strip().lower()
                             if not k or k == "once":
-                                # одноразовое — удаляем
                                 cur2.execute("DELETE FROM reminders WHERE id = %s", (rid,))
                             else:
-                                # повторяющееся — пересчитать next_at
                                 r_dict = {
                                     "id": rid,
                                     "kind": k,
@@ -299,7 +296,7 @@ class UniversalReminderScheduler:
                                 }
                                 nxt = self._calc_next_for_kind(r_dict, now_utc)
                                 if nxt is None:
-                                    # предохранитель: не зацикливаем и не спамим
+                                    # предохранитель: ставим на паузу, чтобы не спамить
                                     cur2.execute(
                                         "UPDATE reminders SET next_at = NULL, paused = true WHERE id = %s",
                                         (rid,),
@@ -311,8 +308,7 @@ class UniversalReminderScheduler:
                         logger.exception("Post-process failed for reminder id=%s", rid)
 
             except asyncio.CancelledError:
-                # корректная остановка при отмене таска (редеплой и т.п.)
-                break
+                break  # корректная остановка при отмене таска
             except Exception:
                 logger.exception("Reminders loop iteration failed")
 
