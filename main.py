@@ -22,8 +22,15 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from croniter import croniter
 
 # ==== локальные модули ====
-from scheduler_core import TournamentScheduler, UniversalReminderScheduler
-from texts import HELP_TEXT
+from scheduler_core import (
+    TournamentScheduler,
+    UniversalReminderScheduler,
+    TOURNAMENT_MINUTES,
+    START_DISPLAY_MAP,
+    TITLE_TOURNAMENT,
+    DEFAULT_TZ as TOURNEY_TZ,
+)
+from texts import HELP_TEXT, pick_phrase, TOURNAMENT_VARIANTS
 from db import (
     upsert_chat,
     upsert_telegram_user,
@@ -33,7 +40,9 @@ from db import (
     add_recurring_reminder,
     delete_reminder_by_id,
     set_paused,
+    set_tournament_subscription,
 )
+import pytz
 
 # ================== Конфигурация ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -160,13 +169,19 @@ def _parse_repeat_to_cron(raw: str) -> str:
     if s.startswith("ежедневно"):
         rest = s.replace("ежедневно", "").strip()
         if ":" in rest:
-            hh, mm = rest.split(":", 1)
-            return f"{int(mm)} {int(hh)} * * *"
+            try:
+                hh, mm = rest.split(":", 1)
+                return f"{int(mm)} {int(hh)} * * *"
+            except ValueError:
+                return "* * * * *"
 
     # 14:30 → ежедневно
     if ":" in s:
-        hh, mm = s.split(":", 1)
-        return f"{int(mm)} {int(hh)} * * *"
+        try:
+            hh, mm = s.split(":", 1)
+            return f"{int(mm)} {int(hh)} * * *"
+        except ValueError:
+            return "* * * * *"
 
     # по умолчанию — каждую минуту
     return "* * * * *"
@@ -183,6 +198,56 @@ def _fmt_utc(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC)")
+
+
+def _get_tourney_tz():
+    try:
+        return pytz.timezone(TOURNEY_TZ)
+    except Exception:
+        return pytz.timezone("Europe/Moscow")
+
+
+def _next_tournament_pair(now: datetime | None = None) -> tuple[datetime, datetime]:
+    tz = _get_tourney_tz()
+    current = now.astimezone(tz) if now else datetime.now(tz)
+    current = current.replace(second=0, microsecond=0)
+    base_day = current.replace(hour=0, minute=0)
+    for hour, minute in TOURNAMENT_MINUTES:
+        remind_dt = base_day.replace(hour=hour, minute=minute)
+        if remind_dt >= current:
+            start_hour, start_minute = START_DISPLAY_MAP[(hour, minute)]
+            start_dt = remind_dt.replace(hour=start_hour, minute=start_minute)
+            if start_hour < hour:
+                start_dt += timedelta(days=1)
+            return remind_dt, start_dt
+    # если все уже прошли — берём первый слот следующего дня
+    hour, minute = TOURNAMENT_MINUTES[0]
+    remind_dt = base_day.replace(hour=hour, minute=minute) + timedelta(days=1)
+    start_hour, start_minute = START_DISPLAY_MAP[(hour, minute)]
+    start_dt = remind_dt.replace(hour=start_hour, minute=start_minute)
+    if start_hour < hour:
+        start_dt += timedelta(days=1)
+    return remind_dt, start_dt
+
+
+def _build_tourney_schedule() -> str:
+    tz = _get_tourney_tz()
+    base_day = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    lines = [
+        "<b>Расписание турниров</b>",
+        f"Таймзона: {tz.zone}",
+        "",
+    ]
+    for hour, minute in TOURNAMENT_MINUTES:
+        remind_dt = base_day.replace(hour=hour, minute=minute)
+        start_hour, start_minute = START_DISPLAY_MAP[(hour, minute)]
+        start_dt = remind_dt.replace(hour=start_hour, minute=start_minute)
+        if start_hour < hour:
+            start_dt += timedelta(days=1)
+        lines.append(
+            f"Напоминание {remind_dt.strftime('%H:%M')} → старт {start_dt.strftime('%H:%M')}"
+        )
+    return "\n".join(lines)
 
 # ========= вспомогательные для /list =========
 def _build_reminders_list_text(rows: list[dict]) -> str:
@@ -242,6 +307,44 @@ async def cmd_ping(m: types.Message):
         await m.answer(f"pong ✅ | db=ok | sched={sched}")
     except Exception as e:
         await m.answer(f"pong ❌ | db error: <code>{e}</code>")
+
+
+@dp.message(Command("subscribe_tournaments"))
+async def cmd_subscribe_tournaments(m: types.Message):
+    await _ensure_user_chat(m)
+    set_tournament_subscription(m.chat.id, True, m.from_user.id if m.from_user else None)
+    await m.answer(
+        "Турнирные напоминания включены."
+        "\nБуду писать за 5 минут до стартов с 14:00 до 00:00 (по МСК)."
+    )
+
+
+@dp.message(Command("unsubscribe_tournaments"))
+async def cmd_unsubscribe_tournaments(m: types.Message):
+    await _ensure_user_chat(m)
+    set_tournament_subscription(m.chat.id, False, m.from_user.id if m.from_user else None)
+    await m.answer("Турнирные напоминания отключены.")
+
+
+@dp.message(Command("tourney_now"))
+async def cmd_tourney_now(m: types.Message):
+    await _ensure_user_chat(m)
+    remind_dt, start_dt = _next_tournament_pair()
+    text = pick_phrase(
+        TOURNAMENT_VARIANTS,
+        title=TITLE_TOURNAMENT,
+        time=start_dt.strftime("%H:%M"),
+    )
+    await m.answer(
+        f"{text}\nСледующее уведомление запланировано на "
+        f"{remind_dt.strftime('%H:%M %Z')}"
+    )
+
+
+@dp.message(Command("schedule"))
+async def cmd_schedule(m: types.Message):
+    await _ensure_user_chat(m)
+    await m.answer(_build_tourney_schedule())
 
 # -------- /add (одноразовое) --------
 @dp.message(Command("add"))
@@ -401,6 +504,10 @@ async def on_startup():
             BotCommand("add", "Создать разовое напоминание"),
             BotCommand("add_repeat", "Создать повторяющееся"),
             BotCommand("list", "Список с кнопками"),
+            BotCommand("schedule", "Расписание турниров"),
+            BotCommand("subscribe_tournaments", "Включить турниры"),
+            BotCommand("unsubscribe_tournaments", "Выключить турниры"),
+            BotCommand("tourney_now", "Пробное турнирное"),
             BotCommand("ping", "Проверка состояния"),
         ],
         scope=BotCommandScopeAllPrivateChats(),

@@ -1,9 +1,7 @@
 aiogram==3.4.1
 APScheduler==3.10.4
-psycopg2-binary==2.9.9
+croniter==2.0.5
+fastapi==0.115.0
 python-dotenv==1.0.1
 pytz==2024.1
-croniter==2.0.5
 uvicorn==0.30.6
-fastapi==0.115.0
-supabase

@@ -3,6 +3,7 @@ import os
 import asyncio
 import logging
 from datetime import datetime, time as dtime, timedelta, timezone
+from typing import Optional
 
 import pytz
 from aiogram import Bot
@@ -143,6 +144,35 @@ class UniversalReminderScheduler:
         except Exception:
             return None
 
+    @staticmethod
+    def _from_db_ts(value) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            try:
+                dt = datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+
+    @staticmethod
+    def _to_db_ts(value: Optional[datetime]) -> Optional[str]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
     def _calc_next_for_kind(self, r: dict, now_utc: datetime) -> datetime | None:
         """
         Возвращает следующий момент (UTC) для повторяющегося напоминания.
@@ -229,15 +259,18 @@ class UniversalReminderScheduler:
                 "id": rid,
                 "kind": (kind or "").strip().lower(),
                 "cron_expr": cron_expr,
-                "remind_at": remind_at,
-                "next_at": next_at,
+                "remind_at": self._from_db_ts(remind_at),
+                "next_at": self._from_db_ts(next_at),
             }
             nxt = self._calc_next_for_kind(r_dict, now_utc)
             if nxt:
                 try:
                     with get_conn() as c2:
                         cur2 = c2.cursor()
-                        cur2.execute("UPDATE reminders SET next_at = %s WHERE id = %s", (nxt, rid))
+                        cur2.execute(
+                            "UPDATE reminders SET next_at = ?, updated_at = ? WHERE id = ?",
+                            (self._to_db_ts(nxt), self._now_iso(), rid),
+                        )
                         c2.commit()
                 except Exception:
                     logger.exception("Failed to backfill next_at for reminder id=%s", rid)
@@ -257,22 +290,27 @@ class UniversalReminderScheduler:
                     cur = c.cursor()
                     cur.execute(
                         """
-                        SELECT id, chat_id, text, kind, cron_expr
-                             , remind_at, next_at
+                        SELECT id, chat_id, text, kind, cron_expr,
+                               remind_at, next_at
                         FROM reminders
-                        WHERE paused = false
-                          AND COALESCE(next_at, remind_at) <= %s
+                        WHERE paused = 0
+                          AND COALESCE(next_at, remind_at) <= ?
                         ORDER BY COALESCE(next_at, remind_at) ASC
                         LIMIT 50
                         """,
-                        (now_utc,),
+                        (self._to_db_ts(now_utc),),
                     )
                     rows = cur.fetchall()
 
                 # 3) Отправляем пользователю
                 for row in rows:
-                    # row как tuple (с psycopg2 без DictCursor); индексы строго по SELECT
-                    rid, chat_id, text, kind, cron_expr, remind_at, next_at = row
+                    rid = row["id"]
+                    chat_id = row["chat_id"]
+                    text = row["text"]
+                    kind = row["kind"]
+                    cron_expr = row["cron_expr"]
+                    remind_at = self._from_db_ts(row["remind_at"])
+                    next_at = self._from_db_ts(row["next_at"])
                     try:
                         # В сообщении — только человекочитаемый текст
                         await self.bot.send_message(chat_id, f"⏰ Напоминание: <b>{text}</b>")
@@ -287,7 +325,7 @@ class UniversalReminderScheduler:
                             k = (kind or "").strip().lower()
                             if not k or k == "once":
                                 # одноразовое — удаляем
-                                cur2.execute("DELETE FROM reminders WHERE id = %s", (rid,))
+                                cur2.execute("DELETE FROM reminders WHERE id = ?", (rid,))
                             else:
                                 # повторяющееся — пересчитать next_at
                                 r_dict = {
@@ -301,11 +339,14 @@ class UniversalReminderScheduler:
                                 if nxt is None:
                                     # предохранитель: не зацикливаем и не спамим
                                     cur2.execute(
-                                        "UPDATE reminders SET next_at = NULL, paused = true WHERE id = %s",
+                                        "UPDATE reminders SET next_at = NULL, paused = 1 WHERE id = ?",
                                         (rid,),
                                     )
                                 else:
-                                    cur2.execute("UPDATE reminders SET next_at = %s WHERE id = %s", (nxt, rid))
+                                    cur2.execute(
+                                        "UPDATE reminders SET next_at = ?, updated_at = ? WHERE id = ?",
+                                        (self._to_db_ts(nxt), self._now_iso(), rid),
+                                    )
                             c2.commit()
                     except Exception:
                         logger.exception("Post-process failed for reminder id=%s", rid)
