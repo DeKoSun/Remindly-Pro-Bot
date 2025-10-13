@@ -128,7 +128,10 @@ class UniversalReminderScheduler:
 
     def stop(self):
         if self._task:
-            self._task.cancel()
+            try:
+                self._task.cancel()
+            except Exception:
+                pass
 
     # ---------- helpers ----------
 
@@ -243,66 +246,74 @@ class UniversalReminderScheduler:
 
     async def _check_reminders(self):
         while True:
-            now_utc = datetime.now(timezone.utc)
+            try:
+                now_utc = datetime.now(timezone.utc)
 
-            # 1) Проставим next_at там, где он пустой у повторов
-            self._backfill_next_at_for_active_repeats(now_utc)
+                # 1) Проставим next_at там, где он пустой у повторов
+                self._backfill_next_at_for_active_repeats(now_utc)
 
-            # 2) Забираем due-напоминания
-            with get_conn() as c:
-                cur = c.cursor()
-                cur.execute(
-                    """
-                    SELECT id, chat_id, text, kind, cron_expr
-                         , remind_at, next_at
-                    FROM reminders
-                    WHERE paused = false
-                      AND COALESCE(next_at, remind_at) <= now()
-                    ORDER BY COALESCE(next_at, remind_at) ASC
-                    LIMIT 50
-                    """
-                )
-                rows = cur.fetchall()
+                # 2) Забираем due-напоминания (сравнение с параметром now_utc)
+                with get_conn() as c:
+                    cur = c.cursor()
+                    cur.execute(
+                        """
+                        SELECT id, chat_id, text, kind, cron_expr
+                             , remind_at, next_at
+                        FROM reminders
+                        WHERE paused = false
+                          AND COALESCE(next_at, remind_at) <= %s
+                        ORDER BY COALESCE(next_at, remind_at) ASC
+                        LIMIT 50
+                        """,
+                        (now_utc,),
+                    )
+                    rows = cur.fetchall()
 
-            # 3) Отправляем пользователю
-            for row in rows:
-                # row как tuple (с psycopg2 без DictCursor); индексы строго по SELECT
-                rid, chat_id, text, kind, cron_expr, remind_at, next_at = row
-                try:
-                    # В сообщении — только человекочитаемый текст
-                    await self.bot.send_message(chat_id, f"⏰ Напоминание: <b>{text}</b>")
-                    logger.info("sent reminder id=%s chat_id=%s", rid, chat_id)
-                except Exception as e:
-                    logger.exception("Failed to send reminder id=%s chat_id=%s: %s", rid, chat_id, e)
+                # 3) Отправляем пользователю
+                for row in rows:
+                    # row как tuple (с psycopg2 без DictCursor); индексы строго по SELECT
+                    rid, chat_id, text, kind, cron_expr, remind_at, next_at = row
+                    try:
+                        # В сообщении — только человекочитаемый текст
+                        await self.bot.send_message(chat_id, f"⏰ Напоминание: <b>{text}</b>")
+                        logger.info("sent reminder id=%s chat_id=%s", rid, chat_id)
+                    except Exception as e:
+                        logger.exception("Failed to send reminder id=%s chat_id=%s: %s", rid, chat_id, e)
 
-                # 4) Пост-обработка: удалить once или сдвинуть next_at для повторов
-                try:
-                    with get_conn() as c2:
-                        cur2 = c2.cursor()
-                        k = (kind or "").strip().lower()
-                        if not k or k == "once":
-                            # одноразовое — удаляем
-                            cur2.execute("DELETE FROM reminders WHERE id = %s", (rid,))
-                        else:
-                            # повторяющееся — пересчитать next_at
-                            r_dict = {
-                                "id": rid,
-                                "kind": k,
-                                "cron_expr": cron_expr,
-                                "remind_at": remind_at,
-                                "next_at": next_at,
-                            }
-                            nxt = self._calc_next_for_kind(r_dict, now_utc)
-                            if nxt is None:
-                                # предохранитель: не зацикливаем и не спамим
-                                cur2.execute(
-                                    "UPDATE reminders SET next_at = NULL, paused = true WHERE id = %s",
-                                    (rid,),
-                                )
+                    # 4) Пост-обработка: удалить once или сдвинуть next_at для повторов
+                    try:
+                        with get_conn() as c2:
+                            cur2 = c2.cursor()
+                            k = (kind or "").strip().lower()
+                            if not k or k == "once":
+                                # одноразовое — удаляем
+                                cur2.execute("DELETE FROM reminders WHERE id = %s", (rid,))
                             else:
-                                cur2.execute("UPDATE reminders SET next_at = %s WHERE id = %s", (nxt, rid))
-                        c2.commit()
-                except Exception:
-                    logger.exception("Post-process failed for reminder id=%s", rid)
+                                # повторяющееся — пересчитать next_at
+                                r_dict = {
+                                    "id": rid,
+                                    "kind": k,
+                                    "cron_expr": cron_expr,
+                                    "remind_at": remind_at,
+                                    "next_at": next_at,
+                                }
+                                nxt = self._calc_next_for_kind(r_dict, now_utc)
+                                if nxt is None:
+                                    # предохранитель: не зацикливаем и не спамим
+                                    cur2.execute(
+                                        "UPDATE reminders SET next_at = NULL, paused = true WHERE id = %s",
+                                        (rid,),
+                                    )
+                                else:
+                                    cur2.execute("UPDATE reminders SET next_at = %s WHERE id = %s", (nxt, rid))
+                            c2.commit()
+                    except Exception:
+                        logger.exception("Post-process failed for reminder id=%s", rid)
+
+            except asyncio.CancelledError:
+                # корректная остановка при отмене таска (редеплой и т.п.)
+                break
+            except Exception:
+                logger.exception("Reminders loop iteration failed")
 
             await asyncio.sleep(self.poll_interval_sec)
