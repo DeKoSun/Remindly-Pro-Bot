@@ -38,7 +38,7 @@ def get_conn():
 # ========= HELPERS =========
 
 def _iso(dt: datetime) -> str:
-    """UTC ISO8601."""
+    """Возврат UTC ISO8601."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()

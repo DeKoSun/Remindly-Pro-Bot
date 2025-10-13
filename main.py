@@ -47,7 +47,7 @@ if not BOT_TOKEN or not PUBLIC_BASE_URL:
 def _default_props():
     """
     Aiogram 3 использует Pydantic. В v2 есть model_validate, в v1 — обычный конструктор.
-    Этот хелпер делает создание совместимым и убирает BaseModel.__init__() ошибки.
+    Хелпер делает создание совместимым и убирает BaseModel.__init__() ошибки.
     """
     try:
         # Pydantic v2
