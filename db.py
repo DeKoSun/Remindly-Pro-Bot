@@ -1,4 +1,3 @@
-# db.py
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -8,7 +7,6 @@ import psycopg2
 import psycopg2.extras
 from supabase import create_client
 from croniter import croniter, CroniterBadCronError
-
 
 # ========= ENV / CLIENTS =========
 
@@ -196,7 +194,7 @@ def add_reminder(
     text: str,
     remind_at: datetime,
     *,
-    created_by: Optional[int] = None,  # ← терпим вызовы с этим именованным параметром
+    created_by: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Одноразовое напоминание."""
     ensure_parent_rows(user_id, chat_id)
@@ -221,7 +219,7 @@ def add_recurring_reminder(
     cron_expr: str,
     *,
     next_at: Optional[datetime] = None,
-    created_by: Optional[int] = None,  # ← и здесь тоже
+    created_by: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Повторяющееся напоминание (cron)."""
     ensure_parent_rows(user_id, chat_id)
@@ -253,7 +251,6 @@ def get_active_reminders(user_id: int):
         supabase.table("reminders")
         .select("*")
         .eq("user_id", user_id)
-        .eq("paused", False)
         .order("remind_at", nullsfirst=True)
         .order("next_at", nullsfirst=True)
         .execute()
