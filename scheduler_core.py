@@ -1,226 +1,157 @@
-# scheduler_core.py
 import asyncio
 import logging
-import re
-from datetime import datetime, timezone, time
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
 
-import pytz
 from aiogram import Bot
-from apscheduler.executors.asyncio import AsyncIOExecutor
-from apscheduler.jobstores.memory import MemoryJobStore
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+from croniter import croniter
+import pytz
 
-from db import (
-    get_due_once_and_recurring,
-    delete_reminder_by_id,
-    advance_recurring,
-    get_tournament_subscribed_chats,
-)
-from texts import pick_phrase, TOURNAMENT_VARIANTS
+from db import Db
 
-logger = logging.getLogger("remindly")
+log = logging.getLogger("scheduler")
 
-DEFAULT_TZ = "Europe/Moscow"
-TITLE_TOURNAMENT = "Быстрый турнир"
+FOOTER_RECURRING = "🔁 Повтор через 15 минут"
 
-# Напоминания за 5 минут до стартов (MSK): 14, 16, 18, 20, 22, 00
-TOURNAMENT_MINUTES = [
-    (13, 55),  # 14:00
-    (15, 55),  # 16:00
-    (17, 55),  # 18:00
-    (19, 55),  # 20:00
-    (21, 55),  # 22:00
-    (23, 55),  # 00:00 следующего дня
-]
-
-# Для текста «во сколько старт»
-START_DISPLAY_MAP = {
-    (13, 55): (14, 0),
-    (15, 55): (16, 0),
-    (17, 55): (18, 0),
-    (19, 55): (20, 0),
-    (21, 55): (22, 0),
-    (23, 55): (0, 0),
-}
-
-
-# ---------------------- Турнирные напоминания ---------------------- #
-class TournamentScheduler:
-    """Планировщик турнирных напоминаний (через APScheduler)."""
-
-    def __init__(self, bot: Bot):
+class SchedulerCore:
+    def __init__(self, bot: Bot, tz_name: str = "UTC", interval_seconds: int = 30, debug: bool = False):
         self.bot = bot
-        self.scheduler = AsyncIOScheduler(
-            jobstores={"default": MemoryJobStore()},
-            executors={"default": AsyncIOExecutor()},
-            job_defaults={"misfire_grace_time": 24 * 3600},
-            timezone=pytz.timezone(DEFAULT_TZ),
-        )
+        self.tz = pytz.timezone(tz_name)
+        self.interval = interval_seconds
+        self._task: asyncio.Task | None = None
+        self.debug = debug
 
-    def start(self) -> None:
-        # Запускаем APScheduler и ставим периодическую задачу пересборки расписания
-        self.scheduler.start()
-        # Перебинд — каждые 5 минут
-        self.scheduler.add_job(
-            self._ensure_tournament_jobs,
-            CronTrigger.from_crontab("*/5 * * * *", timezone=self.scheduler.timezone),
-            id="tour_ensure_jobs",
-            replace_existing=True,
-        )
-        # И сразу один прогон на запуске
-        self.scheduler.add_job(
-            self._ensure_tournament_jobs,
-            next_run_time=datetime.now(self.scheduler.timezone),
-            id="tour_ensure_jobs_boot",
-            replace_existing=True,
-        )
-        logger.info("TournamentScheduler started")
-
-    def stop(self) -> None:
-        try:
-            self.scheduler.shutdown(wait=False)
-        except Exception:
-            pass
-
-    async def _send_tournament(self, chat_id: int, notify_time: time) -> None:
-        start_str = f"{notify_time.hour:02d}:{notify_time.minute:02d}"
-        text = pick_phrase(TOURNAMENT_VARIANTS, title=TITLE_TOURNAMENT, time=start_str)
-        await self.bot.send_message(chat_id, text)
-
-    def _register_daily_jobs_for_chat(self, chat_id: int, tz_name: Optional[str]) -> None:
-        tz = pytz.timezone(tz_name or DEFAULT_TZ)
-        for hour, minute in TOURNAMENT_MINUTES:
-            job_id = f"tour_{chat_id}_{hour:02d}{minute:02d}"
-            old = self.scheduler.get_job(job_id)
-            if old:
-                old.remove()
-            self.scheduler.add_job(
-                self._send_tournament,
-                CronTrigger(hour=hour, minute=minute, timezone=tz),
-                id=job_id,
-                args=[chat_id, time(*START_DISPLAY_MAP[(hour, minute)])],
-                replace_existing=True,
-            )
-            logger.debug("Registered tour job %s in tz=%s", job_id, tz.key)
-
-    def _ensure_tournament_jobs(self) -> None:
-        rows = get_tournament_subscribed_chats()  # [(chat_id, tz_name?)]
-        for r in rows:
-            chat_id = r[0]
-            tz_name = r[1] if len(r) > 1 else None
-            self._register_daily_jobs_for_chat(chat_id, tz_name)
-
-
-# ----------------- Универсальные (once/cron) напоминания ----------------- #
-class UniversalReminderScheduler:
-    """Фоновый поллер напоминаний (every N seconds). Работает строго в UTC."""
-
-    def __init__(self, bot: Bot, poll_interval_sec: int = 30):
-        self.bot = bot
-        self.poll_interval_sec = max(5, int(poll_interval_sec))  # защита от слишком маленьких значений
-        self._task: Optional[asyncio.Task] = None
-        self._stopping = False
-
-    def start(self):
+    async def start(self):
         if self._task and not self._task.done():
             return
-        self._stopping = False
-        self._task = asyncio.create_task(self._loop(), name="universal-reminders")
-        logger.info("UniversalReminderScheduler started (interval=%ss)", self.poll_interval_sec)
+        self._task = asyncio.create_task(self._runner())
 
-    async def stop(self):
-        self._stopping = True
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except Exception:
-                pass
-
-    async def _loop(self):
-        # Первый «мгновенный» тик — чтобы не ждать интервал
-        try:
-            await self._tick()
-        except Exception as e:
-            logger.exception("first scheduler tick failed: %s", e)
-
-        while not self._stopping:
+    async def _runner(self):
+        log.info("Scheduler started; interval=%ss", self.interval)
+        while True:
             try:
                 await self._tick()
             except Exception as e:
-                logger.exception("scheduler tick failed: %s", e)
-            # Небольшой джиттер, чтобы не «липнуть» на ровные секунды
-            await asyncio.sleep(self.poll_interval_sec)
+                log.exception("scheduler tick error: %s", e)
+            await asyncio.sleep(self.interval)
 
     async def _tick(self):
-        # now в UTC — вся логика выборки в БД должна ориентироваться на это же
-        now = datetime.now(timezone.utc)
-
-        # Берём все, что просрочено к текущему моменту (с окном 60 секунд)
-        once_items, cron_items = get_due_once_and_recurring(window_minutes=1)
-        logger.info(
-            "[universal] %s due_once=%s due_cron=%s",
-            now.isoformat(),
-            len(once_items),
-            len(cron_items),
-        )
-
-        # --- Одноразовые ---
-        for r in once_items:
-            rid = r.get("id")
-            chat_id = r.get("chat_id")
-            text = (r.get("text") or "").strip()
+        due = await Db.get_due(window_seconds=self.interval)
+        if self.debug:
+            log.debug("due count: %s", len(due))
+        for r in due:
             try:
-                if not chat_id:
-                    logger.warning("once reminder without chat_id, id=%s", rid)
-                    continue
-                msg_txt = f"⏰ Напоминание: <b>{text}</b>" if text else "⏰ Напоминание!"
-                await self.bot.send_message(chat_id, msg_txt)
-                delete_reminder_by_id(rid)
-                logger.info("[sent-once] id=%s chat=%s", rid, chat_id)
+                await self._deliver(r)
+                if r["kind"] == "once":
+                    await Db.complete_once(r["id"])
+                else:
+                    # compute next by cron
+                    next_at = self._next_from_cron(r["cron_expr"])
+                    await Db.set_next(r["id"], next_at)
             except Exception as e:
-                logger.exception("send once failed (id=%s): %s", rid, e)
+                log.exception("deliver error id=%s: %s", r["id"], e)
 
-        # --- Повторяющиеся (cron) ---
-        for r in cron_items:
-            rid = r.get("id")
-            chat_id = r.get("chat_id")
-            text = (r.get("text") or "").strip()
-            cron_expr = (r.get("cron_expr") or "").strip() or "* * * * *"
+    async def _deliver(self, r: dict):
+        chat_id = r["chat_id"]
+        text = r["text"]
+        if r["kind"] == "cron":
+            text = f"{text}\n\n{FOOTER_RECURRING}"
+        await self.bot.send_message(chat_id, f"⏰ Напоминание: <b>{text}</b>")
+
+    # ------------- parsing helpers -------------
+
+    @staticmethod
+    async def parse_when(raw: str, tz_name: str = "UTC") -> Optional[datetime]:
+        """
+        Примеры:
+          14:30
+          завтра 10:00
+          через 25 минут
+          +15  (минут)
+        """
+        raw = raw.strip().lower()
+        now = datetime.now(pytz.timezone(tz_name))
+
+        # +N (минут)
+        if raw.startswith("+"):
             try:
-                if not chat_id:
-                    logger.warning("cron reminder without chat_id, id=%s", rid)
-                    continue
+                minutes = int(raw[1:].strip())
+                return now + timedelta(minutes=minutes)
+            except:
+                pass
 
-                footer = self._repeat_footer(cron_expr)
-                msg_txt = f"⏰ Напоминание: <b>{text}</b>\n{footer}" if text else f"⏰ Напоминание!\n{footer}"
-                await self.bot.send_message(chat_id, msg_txt)
+        # через N минут (склонения)
+        for kw in ("минуты", "минуту", "минут", "минута"):
+            if "через" in raw and kw in raw:
+                try:
+                    n = int("".join(ch for ch in raw if ch.isdigit()))
+                    return now + timedelta(minutes=n)
+                except:
+                    pass
 
-                # Сдвигаем next_at вперёд согласно cron_expr (на стороне БД)
-                advance_recurring(rid, cron_expr)
-                logger.info("[sent-cron] id=%s chat=%s advanced", rid, chat_id)
-            except Exception as e:
-                logger.exception("send cron failed (id=%s): %s", rid, e)
+        # завтра HH:MM
+        if raw.startswith("завтра"):
+            parts = raw.split()
+            if len(parts) >= 2 and ":" in parts[1]:
+                hh, mm = parts[1].split(":")[:2]
+                base = (now + timedelta(days=1)).replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+                return base
 
-    # Подпись для повторяющихся
-    def _repeat_footer(self, cron_expr: str) -> str:
-        # */N * * * *  → каждые N минут
-        m = re.match(r"^\*/(\d+)\s+\*\s+\*\s+\*\s+\*$", cron_expr)
-        if m:
-            n = int(m.group(1))
-            return f"🔁 Повтор через {n} мин"
+        # HH:MM сегодня/ближайшее
+        if ":" in raw:
+            try:
+                hh, mm = raw.split(":")[:2]
+                cand = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+                if cand <= now:
+                    cand += timedelta(days=1)
+                return cand
+            except:
+                pass
 
-        # M H * * * → ежедневно HH:MM
-        m2 = re.match(r"^(\d+)\s+(\d+)\s+\*\s+\*\s+\*$", cron_expr)
-        if m2:
-            mm = int(m2.group(1))
-            hh = int(m2.group(2))
-            return f"🔁 Ежедневно в {hh:02d}:{mm:02d}"
+        return None
 
-        # Любой другой cron
-        return "🔁 Повтор по расписанию"
+    @staticmethod
+    async def parse_repeat(raw: str, tz_name: str = "UTC") -> Tuple[Optional[str], Optional[datetime]]:
+        """
+        Возвращает (cron_expr, next_at)
+        Поддержка:
+          • "каждую минуту"
+          • "ежедневно HH:MM"
+          • "HH:MM"
+          • "cron: * * * * *"
+        """
+        raw = raw.strip().lower()
+        tz = pytz.timezone(tz_name)
+        now = datetime.now(tz)
 
+        if raw.startswith("cron:"):
+            expr = raw.replace("cron:", "").strip()
+            try:
+                nxt = datetime.fromtimestamp(croniter(expr, now).get_next(float), tz)
+                return expr, nxt
+            except:
+                return None, None
 
-__all__ = ["TournamentScheduler", "UniversalReminderScheduler"]
+        if "каждую минуту" in raw:
+            expr = "* * * * *"
+            nxt = datetime.fromtimestamp(croniter(expr, now).get_next(float), tz)
+            return expr, nxt
+
+        if raw.startswith("ежедневно") and ":" in raw:
+            hh, mm = raw.split()[-1].split(":")[:2]
+            expr = f"{int(mm)} {int(hh)} * * *"
+            nxt = datetime.fromtimestamp(croniter(expr, now).get_next(float), tz)
+            return expr, nxt
+
+        if ":" in raw:
+            hh, mm = raw.split(":")[:2]
+            expr = f"{int(mm)} {int(hh)} * * *"
+            nxt = datetime.fromtimestamp(croniter(expr, now).get_next(float), tz)
+            return expr, nxt
+
+        return None, None
+
+    def _next_from_cron(self, expr: str) -> datetime:
+        now = datetime.now(self.tz)
+        ts = croniter(expr, now).get_next(float)
+        return datetime.fromtimestamp(ts, self.tz)
