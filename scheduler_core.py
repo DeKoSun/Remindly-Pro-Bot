@@ -151,7 +151,6 @@ class UniversalReminderScheduler:
                 await self._tick()
             except Exception as e:
                 logger.exception("scheduler tick failed: %s", e)
-            # Небольшой джиттер, чтобы не «липнуть» на ровные секунды
             await asyncio.sleep(self.poll_interval_sec)
 
     async def _tick(self):
