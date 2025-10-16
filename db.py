@@ -1,106 +1,94 @@
 import asyncpg
-import uuid
-from datetime import datetime, timezone
-from typing import List, Tuple, Optional, Dict
+import os
 
-_pool: asyncpg.Pool | None = None
+_pool = None
 
-class Db:
-    @staticmethod
-    async def init_pool(dsn: str):
-        global _pool
-        _pool = await asyncpg.create_pool(dsn, max_size=10)
+async def db_pool():
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
+    return _pool
 
-    # ---------- create ----------
+# Chats
+async def upsert_chat(chat_id: int, chat_type: str, title: str | None):
+    pool = await db_pool()
+    await pool.execute("""
+        INSERT INTO chats (chat_id, type, title)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (chat_id) DO UPDATE SET type = EXCLUDED.type, title = EXCLUDED.title
+    """, chat_id, chat_type, title)
 
-    @staticmethod
-    async def add_once(user_id: int, chat_id: int, text: str, remind_at: datetime, created_by: Optional[int] = None) -> str:
-        q = """
-        insert into reminders(id, user_id, chat_id, text, kind, remind_at, paused, created_at, created_by)
-        values($1, $2, $3, $4, 'once', $5, false, now() at time zone 'utc', $6)
-        returning id;
-        """
-        rid = str(uuid.uuid4())
-        async with _pool.acquire() as con:
-            await con.fetchval(q, rid, user_id, chat_id, text, remind_at.astimezone(timezone.utc), created_by)
-        return rid
+# Reminders
+async def create_once(chat_id: int, user_id: int, text: str, remind_at_utc):
+    pool = await db_pool()
+    row = await pool.fetchrow("""
+        INSERT INTO reminders (chat_id, user_id, kind, text, remind_at, paused)
+        VALUES ($1, $2, 'once', $3, $4, FALSE)
+        RETURNING id::text
+    """, chat_id, user_id, text, remind_at_utc)
+    return row["id"]
 
-    @staticmethod
-    async def add_cron(user_id: int, chat_id: int, text: str, cron_expr: str, next_at: datetime,
-                       created_by: Optional[int] = None) -> str:
-        q = """
-        insert into reminders(id, user_id, chat_id, text, kind, cron_expr, next_at, paused, created_at, created_by)
-        values($1, $2, $3, $4, 'cron', $5, $6, false, now() at time zone 'utc', $7)
-        returning id;
-        """
-        rid = str(uuid.uuid4())
-        async with _pool.acquire() as con:
-            await con.fetchval(q, rid, user_id, chat_id, text, cron_expr, next_at.astimezone(timezone.utc), created_by)
-        return rid
+async def create_cron(chat_id: int, user_id: int, text: str, cron_expr: str, next_at_utc, category: str | None = None, meta=None):
+    pool = await db_pool()
+    row = await pool.fetchrow("""
+        INSERT INTO reminders (chat_id, user_id, kind, text, cron_expr, next_at, paused, category, meta)
+        VALUES ($1, $2, 'cron', $3, $4, $5, FALSE, $6, $7)
+        RETURNING id::text
+    """, chat_id, user_id, text, cron_expr, next_at_utc, category, meta)
+    return row["id"]
 
-    # ---------- list ----------
+async def list_by_chat(chat_id: int):
+    pool = await db_pool()
+    rows = await pool.fetch("""
+        SELECT id::text, kind, text, remind_at, cron_expr, next_at, paused, category, created_at
+        FROM reminders
+        WHERE chat_id = $1
+        ORDER BY COALESCE(next_at, remind_at) NULLS LAST, created_at
+    """, chat_id)
+    return rows
 
-    @staticmethod
-    async def list_by_chat(chat_id: int) -> List[Dict]:
-        q = """
-        select id, user_id, chat_id, text, kind, remind_at, cron_expr, next_at, paused, created_at, created_by, updated_at
-        from reminders
-        where chat_id=$1
-        order by coalesce(next_at, remind_at, created_at) asc
-        """
-        async with _pool.acquire() as con:
-            rows = await con.fetch(q, chat_id)
-        return [dict(r) for r in rows]
+async def set_paused(reminder_id: str, paused: bool):
+    pool = await db_pool()
+    await pool.execute("UPDATE reminders SET paused=$2 WHERE id=$1", reminder_id, paused)
 
-    # ---------- due scan ----------
+async def delete_reminder(reminder_id: str):
+    pool = await db_pool()
+    await pool.execute("DELETE FROM reminders WHERE id=$1", reminder_id)
 
-    @staticmethod
-    async def get_due(window_seconds: int = 30) -> List[Dict]:
-        q = """
-        select *
-        from reminders
-        where not paused
-          and coalesce(next_at, remind_at) <= (now() at time zone 'utc')
-        order by coalesce(next_at, remind_at) asc
-        """
-        async with _pool.acquire() as con:
-            rows = await con.fetch(q)
-        return [dict(r) for r in rows]
+# Due fetching
+async def fetch_due(limit: int):
+    pool = await db_pool()
+    rows = await pool.fetch("""
+        SELECT id::text, chat_id, user_id, kind, text, remind_at, cron_expr, next_at, paused, category
+        FROM reminders
+        WHERE paused = FALSE
+          AND (
+                (kind='once' AND remind_at IS NOT NULL AND remind_at <= NOW())
+             OR (kind='cron' AND next_at IS NOT NULL AND next_at <= NOW())
+          )
+        ORDER BY COALESCE(next_at, remind_at) ASC
+        LIMIT $1
+    """, limit)
+    return rows
 
-    # ---------- actions ----------
+async def mark_once_delivered_success(reminder_id: str):
+    pool = await db_pool()
+    await pool.execute("DELETE FROM reminders WHERE id=$1", reminder_id)
 
-    @staticmethod
-    async def complete_once(rem_id: str):
-        q = "delete from reminders where id=$1 and kind='once';"
-        async with _pool.acquire() as con:
-            await con.execute(q, rem_id)
+async def shift_cron_next(reminder_id: str, next_at_utc):
+    pool = await db_pool()
+    await pool.execute("UPDATE reminders SET next_at=$2 WHERE id=$1", reminder_id, next_at_utc)
 
-    @staticmethod
-    async def set_next(rem_id: str, next_at: datetime):
-        q = """
-        update reminders
-           set next_at=$2,
-               updated_at=now() at time zone 'utc'
-         where id=$1 and kind='cron';
-        """
-        async with _pool.acquire() as con:
-            await con.execute(q, rem_id, next_at.astimezone(timezone.utc))
+# Tournament subscriptions
+async def set_tournament(chat_id: int, enabled: bool):
+    pool = await db_pool()
+    await pool.execute("""
+        INSERT INTO tournament_subscriptions (chat_id, enabled)
+        VALUES ($1, $2)
+        ON CONFLICT (chat_id) DO UPDATE SET enabled=EXCLUDED.enabled
+    """, chat_id, enabled)
 
-    @staticmethod
-    async def toggle_pause(rem_id: str) -> Tuple[bool, bool]:
-        q = """
-        update reminders
-           set paused = not paused,
-               updated_at=now() at time zone 'utc'
-         where id=$1
-        returning paused;
-        """
-        async with _pool.acquire() as con:
-            row = await con.fetchrow(q, rem_id)
-        return (row is not None, bool(row["paused"]) if row else False)
-
-    @staticmethod
-    async def delete(rem_id: str):
-        q = "delete from reminders where id=$1;"
-        async with _pool.acquire() as con:
-            await con.execute(q, rem_id)
+async def get_tournament(chat_id: int):
+    pool = await db_pool()
+    row = await pool.fetchrow("SELECT enabled FROM tournament_subscriptions WHERE chat_id=$1", chat_id)
+    return row["enabled"] if row else False

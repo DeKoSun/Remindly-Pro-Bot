@@ -1,67 +1,56 @@
--- Supabase uses Postgres; run this in the SQL editor or with psql.
-chat_id bigint PRIMARY KEY,
-type text NOT NULL, -- 'group', 'supergroup', etc.
-title text,
-tournament_subscribed boolean NOT NULL DEFAULT false,
-tz text NOT NULL DEFAULT 'Europe/Moscow',
-created_at timestamptz NOT NULL DEFAULT now(),
-updated_at timestamptz NOT NULL DEFAULT now()
+-- Extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Chats
+CREATE TABLE IF NOT EXISTS chats (
+  chat_id       BIGINT PRIMARY KEY,
+  type          TEXT NOT NULL,        -- "private", "group", "supergroup", "channel"
+  title         TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-
--- schedule_type: one_off | cron | preset
-CREATE TYPE schedule_type AS ENUM ('one_off', 'cron', 'preset');
-
-
+-- Reminders (универсальные + турнирные)
 CREATE TABLE IF NOT EXISTS reminders (
-id bigserial PRIMARY KEY,
-owner_id bigint NOT NULL,
-chat_id bigint NOT NULL,
-title text NOT NULL,
-schedule_kind schedule_type NOT NULL,
-payload_json jsonb NOT NULL, -- stores cron expr, datetime, or preset name
-tz text NOT NULL DEFAULT 'Europe/Moscow',
-is_active boolean NOT NULL DEFAULT true,
-next_run_at timestamptz,
-last_fired_at timestamptz,
-created_at timestamptz NOT NULL DEFAULT now(),
-updated_at timestamptz NOT NULL DEFAULT now()
+  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  chat_id       BIGINT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+  user_id       BIGINT NOT NULL,
+  kind          TEXT NOT NULL CHECK (kind IN ('once','cron')),
+  text          TEXT NOT NULL,
+  remind_at     TIMESTAMPTZ,          -- для once
+  cron_expr     TEXT,                  -- для cron
+  next_at       TIMESTAMPTZ,          -- следующее срабатывание для cron
+  paused        BOOLEAN NOT NULL DEFAULT FALSE,
+  category      TEXT,                  -- NULL | 'tournament'
+  meta          JSONB,                 -- произвольная мета
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Индексы для быстрого поиска "due"
+CREATE INDEX IF NOT EXISTS idx_reminders_once_due
+  ON reminders (remind_at)
+  WHERE kind = 'once' AND paused = FALSE;
 
-CREATE INDEX IF NOT EXISTS reminders_active_idx ON reminders(is_active, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_reminders_cron_due
+  ON reminders (next_at)
+  WHERE kind = 'cron' AND paused = FALSE;
 
-
-CREATE TABLE IF NOT EXISTS runs (
-id bigserial PRIMARY KEY,
-reminder_id bigint NOT NULL REFERENCES reminders(id) ON DELETE CASCADE,
-fired_at timestamptz NOT NULL,
-status text NOT NULL, -- 'ok' | 'error'
-error_text text,
-created_at timestamptz NOT NULL DEFAULT now()
+-- Турнирная подписка (фактический флаг для чата)
+CREATE TABLE IF NOT EXISTS tournament_subscriptions (
+  chat_id    BIGINT PRIMARY KEY REFERENCES chats(chat_id) ON DELETE CASCADE,
+  enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-
--- Simple trigger to auto-update updated_at
-CREATE OR REPLACE FUNCTION set_updated_at()
+-- Утилиты
+CREATE OR REPLACE FUNCTION touch_tournament_subscription()
 RETURNS TRIGGER AS $$
 BEGIN
-NEW.updated_at = now();
-RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+  NEW.updated_at := NOW();
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
 
-
-DROP TRIGGER IF EXISTS trg_users_updated ON users;
-CREATE TRIGGER trg_users_updated BEFORE UPDATE ON users
-FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
-
-
-DROP TRIGGER IF EXISTS trg_chats_updated ON chats;
-CREATE TRIGGER trg_chats_updated BEFORE UPDATE ON chats
-FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
-
-
-DROP TRIGGER IF EXISTS trg_reminders_updated ON reminders;
-CREATE TRIGGER trg_reminders_updated BEFORE UPDATE ON reminders
-FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
+DROP TRIGGER IF EXISTS trg_touch_tournament_subscription ON tournament_subscriptions;
+CREATE TRIGGER trg_touch_tournament_subscription
+BEFORE UPDATE ON tournament_subscriptions
+FOR EACH ROW
+EXECUTE FUNCTION touch_tournament_subscription();
