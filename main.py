@@ -208,6 +208,10 @@ async def cmd_unsub(m: Message):
 
 # ===== Запуск =====
 async def on_startup():
+    # важно: переключаемся на polling
+    await bot.delete_webhook(drop_pending_updates=False)
+    me = await bot.get_me()
+    logging.info("Bot is up: @%s (id=%s)", me.username, me.id)
     # Стартуем фоновый планировщик
     asyncio.create_task(delivery_loop(bot))
 
