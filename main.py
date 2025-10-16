@@ -5,6 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -25,7 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_USER_ID = os.getenv("OWNER_USER_ID", "0")
 PARSE_MODE = os.getenv("PARSE_MODE", "HTML")
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 class AddOnce(StatesGroup):
