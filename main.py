@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("remindly")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_USER_ID = os.getenv("OWNER_USER_ID", "0")
+OWNER_USER_ID = os.getenv("OWNER_USER_ID", "1875150751")
 PARSE_MODE = os.getenv("PARSE_MODE", "HTML")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
