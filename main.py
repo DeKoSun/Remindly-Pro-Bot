@@ -122,7 +122,7 @@ async def add_once_when(m: Message, state: FSMContext):
 
     # Локальное подтверждение (USER_TZ можно поменять в env)
     local_time = format_local_time(remind_at_utc, user_tz_name=USER_TZ, with_tz_abbr=True)
-    await m.answer(CONFIRM_ONCE_SAVED.format(when_human=f"{local_time} (your time)"))
+    await m.answer(CONFIRM_ONCE_SAVED.format(when_human=f"{local_time}"))
 
 
 # ===== Повторяющиеся =====
