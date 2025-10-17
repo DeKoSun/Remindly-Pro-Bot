@@ -86,8 +86,8 @@ async def add_once_when(m: Message, state: FSMContext):
     await m.answer(CONFIRM_ONCE_SAVED.format(when_human=human))
 
 # ===== Повторяющиеся =====
-@dp.message(Command("add_repeat"))
-async def cmd_add_repeat(m: Message, state: FSMContext):
+@dp.message(Command("repeat"))
+async def cmd_repeat(m: Message, state: FSMContext):
     await db.upsert_chat(m.chat.id, m.chat.type, getattr(m.chat, "title", None))
     await state.set_state(AddCron.waiting_text)
     await m.answer(ASK_TEXT_CRON)
