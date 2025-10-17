@@ -21,8 +21,14 @@ from aiogram.types import (
 )
 
 import db
-from scheduler_core import delivery_loop, DEFAULT_TZ
-from time_parse import parse_once_when, parse_repeat_spec, to_utc, to_local
+from scheduler_core import delivery_loop
+from time_parse import (
+    parse_once_when,
+    parse_repeat_spec,
+    to_utc,
+    format_local_time,
+    DEFAULT_TZ,   # базовый TZ бота (обычно Europe/Moscow)
+)
 from texts import *
 from utils import short_rid, is_owner
 from croniter import croniter
@@ -32,7 +38,8 @@ log = logging.getLogger("remindly")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_USER_ID = os.getenv("OWNER_USER_ID", "0")
-PARSE_MODE = os.getenv("PARSE_MODE", "HTML")
+# Часовой пояс по умолчанию для отображения пользователю (можно сменить в Railway → Variables)
+USER_TZ = os.getenv("USER_TZ", "America/New_York")
 
 # aiogram 3.7+: parse_mode через DefaultBotProperties
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -78,6 +85,11 @@ async def cmd_add(m: Message, state: FSMContext):
     await state.set_state(AddOnce.waiting_text)
     await m.answer(ASK_TEXT_ONCE)
 
+# Алиас: /add@BotName
+@dp.message(F.text.regexp(r"^/add(?:@[\w_]+)?\b"))
+async def _alias_add(m: Message, state: FSMContext):
+    return await cmd_add(m, state)
+
 
 @dp.message(AddOnce.waiting_text)
 async def add_once_text(m: Message, state: FSMContext):
@@ -99,15 +111,19 @@ async def add_once_when(m: Message, state: FSMContext):
         return
 
     remind_at_utc = to_utc(when_local, DEFAULT_TZ)
-    _ = await db.create_once(m.chat.id, m.from_user.id, text, remind_at_utc)
+    try:
+        _ = await db.create_once(m.chat.id, m.from_user.id, text, remind_at_utc)
+    except Exception as e:
+        logging.exception("CREATE once failed")
+        await m.answer(f"⚠️ Не удалось сохранить напоминание: {e}")
+        return
+
     await state.clear()
 
-# ✅ Добавляем конвертацию в местное время (пример: Америка/Нью-Йорк)
-    local_time = format_local_time(remind_at_utc, user_tz_name="America/New_York", with_tz_abbr=True)
-
-# ✅ Отправляем подтверждение уже с локальным временем
+    # Локальное подтверждение (USER_TZ можно поменять в env)
+    local_time = format_local_time(remind_at_utc, user_tz_name=USER_TZ, with_tz_abbr=True)
     await m.answer(CONFIRM_ONCE_SAVED.format(when_human=f"{local_time} (your time)"))
-    
+
 
 # ===== Повторяющиеся =====
 @dp.message(Command("repeat"))
@@ -115,7 +131,6 @@ async def cmd_repeat(m: Message, state: FSMContext):
     await db.upsert_chat(m.chat.id, m.chat.type, getattr(m.chat, "title", None))
     await state.set_state(AddCron.waiting_text)
     await m.answer(ASK_TEXT_CRON)
-
 
 # Фоллбэк: поймает /repeat@BotName в группах
 @dp.message(F.text.regexp(r"^/repeat(?:@[\w_]+)?\b"))
@@ -143,9 +158,18 @@ async def add_cron_spec(m: Message, state: FSMContext):
         return
 
     next_utc = to_utc(next_local, DEFAULT_TZ)
-    _ = await db.create_cron(m.chat.id, m.from_user.id, text, cron_expr, next_utc, category=None)
+    try:
+        _ = await db.create_cron(m.chat.id, m.from_user.id, text, cron_expr, next_utc, category=None)
+    except Exception as e:
+        logging.exception("CREATE cron failed")
+        await m.answer(f"⚠️ Не удалось сохранить повторяющееся напоминание: {e}")
+        return
+
     await state.clear()
-    await m.answer(CONFIRM_CRON_SAVED.format(next_local=next_local.strftime("%Y-%m-%d %H:%M")))
+
+    # Покажем пользователю его локальное ближайшее срабатывание
+    local_next = format_local_time(next_utc, user_tz_name=USER_TZ, with_tz_abbr=True)
+    await m.answer(CONFIRM_CRON_SAVED.format(next_local=local_next))
 
 
 # ===== /list =====
@@ -154,13 +178,16 @@ def _row_to_line(row) -> str:
     text = row["text"]
     paused = row["paused"]
     _rid = short_rid(row["id"])
+    # показываем пользователю локальное время (USER_TZ)
     if kind == "once":
-        when = row["remind_at"]
-        return f"• ⏱ {to_local(when, DEFAULT_TZ).strftime('%Y-%m-%d %H:%M')} — “{text}” {'(⏸)' if paused else ''}"
+        when_utc = row["remind_at"]
+        when_str = format_local_time(when_utc, user_tz_name=USER_TZ, with_tz_abbr=False)
+        return f"• ⏱ {when_str} — “{text}” {'(⏸)' if paused else ''}"
     else:
-        nxt = row["next_at"]
+        nxt_utc = row["next_at"]
         expr = row["cron_expr"]
-        return f"• 🔁 {expr} → {to_local(nxt, DEFAULT_TZ).strftime('%Y-%m-%d %H:%M')} — “{text}” {'(⏸)' if paused else ''}"
+        nxt_str = format_local_time(nxt_utc, user_tz_name=USER_TZ, with_tz_abbr=False)
+        return f"• 🔁 {expr} → {nxt_str} — “{text}” {'(⏸)' if paused else ''}"
 
 
 def _row_buttons(row):
@@ -209,20 +236,22 @@ def _tournament_crons_local():
     """
     Напоминания за 5 минут до старта "Быстрого турнира" по МСК.
     Старты: 14:00,16:00,18:00,20:00,22:00,00:00
-    Напоминания отправляются: 13:55,15:55,17:55,19:55,21:55,23:55 (МСК)
-    Возвращаем список cron-выражений в МЕСТНОМ (DEFAULT_TZ) времени.
+    Отправляем в 13:55,15:55,17:55,19:55,21:55,23:55 (МСК).
+    Возвращаем cron в МЕСТНОМ (DEFAULT_TZ=MSK) времени.
     """
-    times = [(13, 55), (15, 55), (17, 55), (19, 55), (21, 55), (23, 55)]  # МСК
-    # "mm hh * * *"
+    times = [(13, 55), (15, 55), (17, 55), (19, 55), (21, 55), (23, 55)]
     return [f"{mm} {hh} * * *" for hh, mm in times]
 
 
 async def _install_tournament_crons_for_chat(chat_id: int, user_id: int):
-    # Удалять существующие турнирные не будем — обновлять next_at при первом срабатывании.
+    # Сделаем операцию идемпотентной: удалим прошлые турнирные слоты, если есть.
+    if hasattr(db, "delete_tournament_crons"):
+        await db.delete_tournament_crons(chat_id)
+
     now_local = datetime.now(tz=DEFAULT_TZ)
     for expr in _tournament_crons_local():
-        next_local = croniter(expr, now_local).get_next(datetime)
-        next_utc = to_utc(next_local, DEFAULT_TZ)
+        next_local = croniter(expr, now_local).get_next(datetime)    # в МСК
+        next_utc = to_utc(next_local, DEFAULT_TZ)                    # храним в UTC
         text = "🏆 «Быстрый турнир» начнётся через 5 минут!"
         await db.create_cron(chat_id, user_id, text, expr, next_utc, category="tournament")
 
@@ -244,6 +273,9 @@ async def cmd_unsub(m: Message):
         await m.answer(NOT_ALLOWED)
         return
     await db.set_tournament(m.chat.id, False)
+    # по желанию можно сразу подчистить слоты:
+    if hasattr(db, "delete_tournament_crons"):
+        await db.delete_tournament_crons(m.chat.id)
     await m.answer(SUB_OFF)
 
 
@@ -266,7 +298,7 @@ async def on_startup():
     await bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
 
     me = await bot.get_me()
-    logging.info("Bot is up: @%s (id=%s)", me.username, me.id)
+    logging.info("Bot is up: @%s (id=%s) USER_TZ=%s DEFAULT_TZ=%s", me.username, me.id, USER_TZ, DEFAULT_TZ.key)
 
     # Стартуем фоновый планировщик
     asyncio.create_task(delivery_loop(bot))
