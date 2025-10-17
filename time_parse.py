@@ -1,9 +1,77 @@
+import os
 import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from croniter import croniter
 
-# Простая нормализация и парсинг
+# ---------------------------------------------
+# Часовые пояса и форматирование
+# ---------------------------------------------
+
+# Базовый (системный) часовой пояс бота: по умолчанию МСК, берём из ENV для гибкости.
+DEFAULT_TZ_NAME = os.getenv("DEFAULT_TZ", "Europe/Moscow")
+DEFAULT_TZ = ZoneInfo(DEFAULT_TZ_NAME)
+MSK_TZ = ZoneInfo("Europe/Moscow")  # фикс для турниров и совместимости
+
+def _safe_zone(tz_name: str | None) -> ZoneInfo:
+    """
+    Возвращает корректный ZoneInfo.
+    Если tz_name не задан или не найден, используется DEFAULT_TZ.
+    """
+    try:
+        if tz_name:
+            return ZoneInfo(tz_name)
+    except Exception:
+        pass
+    return DEFAULT_TZ
+
+def _is_american_tz(tz_name: str | None) -> bool:
+    return bool(tz_name) and tz_name.startswith("America/")
+
+def _hour_format_for(tz_name: str | None) -> str:
+    """
+    Выбираем 12/24-часовой формат.
+    - America/* -> 12h с AM/PM
+    - Остальные -> 24h
+    """
+    if _is_american_tz(tz_name):
+        # %-I — Linux/Unix; на Windows это %#I. Сделаем совместимо.
+        try:
+            # Проверим поддержку %-I на этой платформе (быстрый безопасный тест)
+            datetime.now().strftime("%-I")
+            return "%-I:%M %p"
+        except Exception:
+            return "%#I:%M %p"
+    return "%H:%M"
+
+def format_local_time(dt_utc: datetime, user_tz_name: str | None = None, with_tz_abbr: bool = False) -> str:
+    """
+    Форматирует момент времени (в UTC) в строку в часовом поясе пользователя.
+    - user_tz_name: строка вида "America/New_York", "Asia/Yekaterinburg" и т.п.
+    - with_tz_abbr: добавить ли аббревиатуру зоны (например, MSK, EDT)
+    Возвращает строку "16:57" или "4:57 PM", опционально "4:57 PM (EDT)".
+    """
+    tz = _safe_zone(user_tz_name)
+    local_dt = dt_utc.astimezone(tz)
+    fmt = _hour_format_for(user_tz_name)
+    base = local_dt.strftime(fmt)
+    if with_tz_abbr:
+        return f"{base} ({local_dt.tzname()})"
+    return base
+
+def msk_to_local_time_str(dt_msk: datetime, user_tz_name: str | None = None, with_tz_abbr: bool = False) -> str:
+    """
+    Удобный помощник: принимает время в МСК (aware datetime с tzinfo=Europe/Moscow),
+    переводит в user_tz_name и форматирует как format_local_time.
+    Нужен, если где-то специально храним/создаём МСК-время (например, турниры).
+    """
+    dt_utc = dt_msk.astimezone(ZoneInfo("UTC"))
+    return format_local_time(dt_utc, user_tz_name=user_tz_name, with_tz_abbr=with_tz_abbr)
+
+# ---------------------------------------------
+# Парсинг пользовательского времени (локально)
+# ---------------------------------------------
+
 def parse_once_when(s: str, now_local: datetime, tz: ZoneInfo):
     """
     Возвращает (when_local: datetime, human: str).
@@ -89,8 +157,31 @@ def parse_repeat_spec(s: str, now_local: datetime):
 
     raise ValueError("Не удалось распознать расписание. Примеры: каждую минуту, каждые 2 минуты, ежедневно 09:30, 12:00, cron: */15 * * * *")
 
+# ---------------------------------------------
+# Конвертации (совместимость со старым кодом)
+# ---------------------------------------------
+
 def to_utc(dt_local: datetime, tz: ZoneInfo):
+    """
+    Преобразует локальное время (aware dt в tz) в UTC.
+    Сигнатура сохранена для совместимости.
+    """
     return dt_local.astimezone(ZoneInfo("UTC"))
 
 def to_local(dt_utc: datetime, tz: ZoneInfo):
+    """
+    Преобразует UTC-время в указанный tz (обычно DEFAULT_TZ).
+    Сигнатура сохранена для совместимости.
+    """
     return dt_utc.astimezone(tz)
+
+# ---------------------------------------------
+# Удобные новые хелперы для отображения
+# ---------------------------------------------
+
+def to_local_by_name(dt_utc: datetime, tz_name: str | None) -> datetime:
+    """
+    Возвращает datetime в часовом поясе tz_name.
+    Полезно, если в коде нужно dt, а не строка.
+    """
+    return dt_utc.astimezone(_safe_zone(tz_name))

@@ -101,8 +101,13 @@ async def add_once_when(m: Message, state: FSMContext):
     remind_at_utc = to_utc(when_local, DEFAULT_TZ)
     _ = await db.create_once(m.chat.id, m.from_user.id, text, remind_at_utc)
     await state.clear()
-    await m.answer(CONFIRM_ONCE_SAVED.format(when_human=human))
 
+# ✅ Добавляем конвертацию в местное время (пример: Америка/Нью-Йорк)
+    local_time = format_local_time(remind_at_utc, user_tz_name="America/New_York", with_tz_abbr=True)
+
+# ✅ Отправляем подтверждение уже с локальным временем
+    await m.answer(CONFIRM_ONCE_SAVED.format(when_human=f"{local_time} (your time)"))
+    
 
 # ===== Повторяющиеся =====
 @dp.message(Command("repeat"))
