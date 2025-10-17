@@ -4,6 +4,9 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import random
+from texts import TOURNEY_TEMPLATES
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
@@ -252,7 +255,7 @@ async def _install_tournament_crons_for_chat(chat_id: int, user_id: int):
     for expr in _tournament_crons_local():
         next_local = croniter(expr, now_local).get_next(datetime)    # в МСК
         next_utc = to_utc(next_local, DEFAULT_TZ)                    # храним в UTC
-        text = "🏆 «Быстрый турнир» начнётся через 5 минут!"
+        text = text = random.choice(TOURNEY_TEMPLATES)
         await db.create_cron(chat_id, user_id, text, expr, next_utc, category="tournament")
 
 
