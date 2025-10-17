@@ -3,10 +3,17 @@ import os
 
 _pool = None
 
-async def db_pool():
+async def db_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
+        _pool = await asyncpg.create_pool(
+            dsn=os.getenv("DATABASE_URL"),
+            min_size=1,
+            max_size=5,
+            command_timeout=10,                 # секунды
+            max_inactive_connection_lifetime=300,
+            statement_cache_size=0,             # КЛЮЧЕВОЕ: отключить prepared statements cache
+        )
     return _pool
 
 # Chats
