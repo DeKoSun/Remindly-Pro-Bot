@@ -13,6 +13,7 @@ DEFAULT_TZ_NAME = os.getenv("DEFAULT_TZ", "Europe/Moscow")
 DEFAULT_TZ = ZoneInfo(DEFAULT_TZ_NAME)
 MSK_TZ = ZoneInfo("Europe/Moscow")  # фикс для турниров и совместимости
 
+
 def _safe_zone(tz_name: str | None) -> ZoneInfo:
     """
     Возвращает корректный ZoneInfo.
@@ -25,8 +26,10 @@ def _safe_zone(tz_name: str | None) -> ZoneInfo:
         pass
     return DEFAULT_TZ
 
+
 def _is_american_tz(tz_name: str | None) -> bool:
     return bool(tz_name) and tz_name.startswith("America/")
+
 
 def _hour_format_for(tz_name: str | None) -> str:
     """
@@ -35,14 +38,14 @@ def _hour_format_for(tz_name: str | None) -> str:
     - Остальные -> 24h
     """
     if _is_american_tz(tz_name):
-        # %-I — Linux/Unix; на Windows это %#I. Сделаем совместимо.
+        # %-I — Linux/Unix; на Windows это %#I. Делаем совместимо.
         try:
-            # Проверим поддержку %-I на этой платформе (быстрый безопасный тест)
             datetime.now().strftime("%-I")
             return "%-I:%M %p"
         except Exception:
             return "%#I:%M %p"
     return "%H:%M"
+
 
 def format_local_time(dt_utc: datetime, user_tz_name: str | None = None, with_tz_abbr: bool = False) -> str:
     """
@@ -59,6 +62,7 @@ def format_local_time(dt_utc: datetime, user_tz_name: str | None = None, with_tz
         return f"{base} ({local_dt.tzname()})"
     return base
 
+
 def msk_to_local_time_str(dt_msk: datetime, user_tz_name: str | None = None, with_tz_abbr: bool = False) -> str:
     """
     Удобный помощник: принимает время в МСК (aware datetime с tzinfo=Europe/Moscow),
@@ -67,6 +71,46 @@ def msk_to_local_time_str(dt_msk: datetime, user_tz_name: str | None = None, wit
     """
     dt_utc = dt_msk.astimezone(ZoneInfo("UTC"))
     return format_local_time(dt_utc, user_tz_name=user_tz_name, with_tz_abbr=with_tz_abbr)
+
+
+# ---------------------------------------------
+# Русская морфология для "минут(а/ы)"
+# ---------------------------------------------
+
+def pluralize_minute_acc(n: int) -> str:
+    """
+    Подбирает форму слова 'минута' после предлога 'через' (винительный падеж):
+    1 минуту, 2/3/4 минуты, 5–20 минут, 21 минуту, 22 минуты и т.д.
+    """
+    n = abs(int(n))
+    n100 = n % 100
+    if 11 <= n100 <= 14:
+        return "минут"
+    n10 = n % 10
+    if n10 == 1:
+        return "минуту"
+    if 2 <= n10 <= 4:
+        return "минуты"
+    return "минут"
+
+
+def humanize_repeat_suffix(cron_expr: str) -> str:
+    """
+    Возвращает человекочитаемую подпись для повторок:
+    - */N * * * *  -> 'Повтор через N минут(у/ы/…)'
+    - M H * * *    -> 'Повтор ежедневно'
+    - иначе        -> 'Повтор по расписанию'
+    """
+    m = re.match(r"^\*/(\d+)\s+\*\s+\*\s+\*\s+\*$", cron_expr)
+    if m:
+        n = int(m.group(1))
+        return f"Повтор через {n} {pluralize_minute_acc(n)}"
+
+    if re.match(r"^\d{1,2}\s+\d{1,2}\s+\*\s+\*\s+\*$", cron_expr):
+        return "Повтор ежедневно"
+
+    return "Повтор по расписанию"
+
 
 # ---------------------------------------------
 # Парсинг пользовательского времени (локально)
@@ -82,17 +126,18 @@ def parse_once_when(s: str, now_local: datetime, tz: ZoneInfo):
       "HH:MM" -> сегодня или завтра, если уже прошло
     """
     src = s.strip().lower().replace("  ", " ")
+
     m = re.match(r"^\+?\s*(\d{1,3})\s*$", src)
     if m:
         minutes = int(m.group(1))
         when = now_local + timedelta(minutes=minutes)
-        return when, f"через {minutes} мин."
+        return when, f"через {minutes} {pluralize_minute_acc(minutes)}"
 
     m = re.match(r"^через\s+(\d{1,3})\s*мин(уту|уты|ут|)\.?$", src)
     if m:
         minutes = int(m.group(1))
         when = now_local + timedelta(minutes=minutes)
-        return when, f"через {minutes} мин."
+        return when, f"через {minutes} {pluralize_minute_acc(minutes)}"
 
     m = re.match(r"^завтра\s+(\d{1,2}):(\d{2})$", src)
     if m:
@@ -110,6 +155,7 @@ def parse_once_when(s: str, now_local: datetime, tz: ZoneInfo):
         return candidate, candidate.strftime("сегодня в %H:%M")
 
     raise ValueError("Не удалось распознать время. Примеры: +15, через 30 минут, завтра 09:00, 12:00")
+
 
 def parse_repeat_spec(s: str, now_local: datetime):
     """
@@ -139,7 +185,7 @@ def parse_repeat_spec(s: str, now_local: datetime):
         n = int(m.group(2))
         expr = f"*/{n} * * * *"
         next_local = croniter(expr, now_local).get_next(datetime)
-        return expr, f"через {n} мин.", next_local
+        return expr, f"через {n} {pluralize_minute_acc(n)}", next_local
 
     m = re.match(r"^ежедневно\s+(\d{1,2}):(\d{2})$", src)
     if m:
@@ -157,6 +203,7 @@ def parse_repeat_spec(s: str, now_local: datetime):
 
     raise ValueError("Не удалось распознать расписание. Примеры: каждую минуту, каждые 2 минуты, ежедневно 09:30, 12:00, cron: */15 * * * *")
 
+
 # ---------------------------------------------
 # Конвертации (совместимость со старым кодом)
 # ---------------------------------------------
@@ -168,12 +215,14 @@ def to_utc(dt_local: datetime, tz: ZoneInfo):
     """
     return dt_local.astimezone(ZoneInfo("UTC"))
 
+
 def to_local(dt_utc: datetime, tz: ZoneInfo):
     """
     Преобразует UTC-время в указанный tz (обычно DEFAULT_TZ).
     Сигнатура сохранена для совместимости.
     """
     return dt_utc.astimezone(tz)
+
 
 # ---------------------------------------------
 # Удобные новые хелперы для отображения
