@@ -441,7 +441,7 @@ async def on_startup():
 
     # Меню команд (и в ЛС, и в группах)
     cmds = [
-        BotCommand(command="help", description="Справка"),
+        BotCommand(command="help", description="Список доступных команд"),
         BotCommand(command="add", description="Одноразовое напоминание"),
         BotCommand(command="repeat", description="Повторяющееся напоминание"),
         BotCommand(command="list", description="Список напоминаний"),
