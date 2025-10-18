@@ -128,10 +128,14 @@ async def delete_tournament_crons(chat_id: int) -> None:
 # Due fetching / Delivery
 # =========================
 async def fetch_due(limit: int):
+    """
+    Забираем наступившие напоминания. ВАЖНО: добавлен meta
+    (используется для timezone при сдвиге cron).
+    """
     pool = await db_pool()
     rows = await pool.fetch(
         """
-        SELECT id::text, chat_id, user_id, kind, text, remind_at, cron_expr, next_at, paused, category
+        SELECT id::text, chat_id, user_id, kind, text, remind_at, cron_expr, next_at, paused, category, meta
         FROM reminders
         WHERE paused = FALSE
           AND (
@@ -184,6 +188,31 @@ async def get_tournament(chat_id: int) -> bool:
         chat_id,
     )
     return row["enabled"] if row else False
+
+
+# =========================
+# Users (timezone)
+# =========================
+async def set_user_timezone(user_id: int, tz_name: str) -> None:
+    """
+    Сохранить предпочтительный часовой пояс пользователя.
+    Требуется колонка `timezone text` в таблице `tg_users`.
+    """
+    pool = await db_pool()
+    await pool.execute(
+        """
+        INSERT INTO tg_users (user_id, timezone)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id) DO UPDATE SET timezone = EXCLUDED.timezone
+        """,
+        user_id, tz_name,
+    )
+
+
+async def get_user_timezone(user_id: int) -> Optional[str]:
+    pool = await db_pool()
+    row = await pool.fetchrow("SELECT timezone FROM tg_users WHERE user_id=$1", user_id)
+    return (row["timezone"] if row and row["timezone"] else None)
 
 
 # =========================

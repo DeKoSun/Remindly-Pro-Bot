@@ -10,7 +10,7 @@ from aiogram import Bot
 
 import db
 from time_parse import (
-    DEFAULT_TZ,   # единый базовый TZ (обычно Europe/Moscow)
+    DEFAULT_TZ,   # базовый TZ — обычно Europe/Moscow
     to_local,
     to_utc,
     humanize_repeat_suffix,
@@ -36,8 +36,7 @@ async def delivery_loop(bot: Bot):
     await asyncio.sleep(2.0)
     log.info(
         "Scheduler started with interval=%s sec, batch=%s",
-        SCHEDULER_INTERVAL_SEC,
-        BATCH_LIMIT,
+        SCHEDULER_INTERVAL_SEC, BATCH_LIMIT,
     )
     while True:
         try:
@@ -49,19 +48,33 @@ async def delivery_loop(bot: Bot):
         await asyncio.sleep(SCHEDULER_INTERVAL_SEC)
 
 
+def _tz_from_meta(meta) -> ZoneInfo:
+    """
+    Достаём таймзону из meta (jsonb) напоминания.
+    meta может быть None/{} или {'tz': 'America/New_York'}.
+    Если нет — используем DEFAULT_TZ.
+    """
+    try:
+        tz_name = (meta or {}).get("tz")
+        return ZoneInfo(tz_name) if tz_name else DEFAULT_TZ
+    except Exception:
+        return DEFAULT_TZ
+
+
 async def _process_due(bot: Bot, r):
     rid = r["id"]
     chat_id = r["chat_id"]
     kind = r["kind"]                # 'once' | 'cron'
     text = r["text"]
     cron_expr = r["cron_expr"]
-    next_at = r["next_at"]          # UTC
+    next_at = r["next_at"]          # UTC-aware
+    meta = r.get("meta")            # jsonb -> dict (или None)
     # category = r["category"]      # сейчас не влияет на текст
 
     # Базовый текст напоминания
     message_text = REMINDER_PREFIX.format(text=text)
 
-    # Подпись для cron (склоняем «минуту/минуты/минут» корректно)
+    # Подпись для cron (склонение «минуту/минуты/минут»)
     suffix = ""
     if kind == "cron":
         try:
@@ -70,10 +83,14 @@ async def _process_due(bot: Bot, r):
             suffix_human = "Повтор по расписанию"
         suffix = REMINDER_CRON_SUFFIX.format(repeat_human=suffix_human)
 
+    # Таймзона для расчёта следующего срабатывания (из meta или DEFAULT_TZ)
+    cron_tz = _tz_from_meta(meta)
+
     try:
         await bot.send_message(
             chat_id,
             message_text + (suffix if kind == "cron" else ""),
+            # parse_mode задаётся в Bot default, но можно продублировать:
             parse_mode=os.getenv("PARSE_MODE", "HTML"),
         )
 
@@ -83,10 +100,10 @@ async def _process_due(bot: Bot, r):
         else:
             # cron — всегда сдвигаем next_at
             base = next_at or datetime.now(tz=ZoneInfo("UTC"))
-            # base(UTC) -> локаль (DEFAULT_TZ) -> расчёт следующего -> снова UTC
-            local_base = to_local(base, DEFAULT_TZ)
+            # base(UTC) -> локаль (cron_tz) -> расчёт следующего -> снова UTC
+            local_base = to_local(base, cron_tz)
             nxt_local = croniter(cron_expr, local_base).get_next(datetime)
-            nxt_utc = to_utc(nxt_local, DEFAULT_TZ)
+            nxt_utc = to_utc(nxt_local, cron_tz)
             await db.shift_cron_next(rid, nxt_utc)
 
     except Exception as e:
@@ -94,9 +111,9 @@ async def _process_due(bot: Bot, r):
         if kind == "cron":
             try:
                 base = next_at or datetime.now(tz=ZoneInfo("UTC"))
-                local_base = to_local(base, DEFAULT_TZ)
+                local_base = to_local(base, cron_tz)
                 nxt_local = croniter(cron_expr, local_base).get_next(datetime)
-                nxt_utc = to_utc(nxt_local, DEFAULT_TZ)
+                nxt_utc = to_utc(nxt_local, cron_tz)
                 await db.shift_cron_next(rid, nxt_utc)
             except Exception:
                 pass
