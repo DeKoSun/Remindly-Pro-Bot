@@ -140,7 +140,7 @@ async def cmd_set_timezone(m: Message, command: CommandObject):
     arg = (command.args or "").strip()
     if not arg:
         await m.answer(
-            "Укажи таймзону, например:\n"
+            "Укажи свой часовой пояс, например:\n"
             "<code>/set_timezone Europe/Moscow</code>\n"
             "<code>/set_timezone America/New_York</code>\n"
             "<code>/set_timezone Asia/Yekaterinburg</code>"
@@ -445,11 +445,11 @@ async def on_startup():
         BotCommand(command="add", description="Одноразовое напоминание"),
         BotCommand(command="repeat", description="Повторяющееся напоминание"),
         BotCommand(command="list", description="Список напоминаний"),
-        BotCommand(command="set_timezone", description="Установить вашу таймзону"),
-        BotCommand(command="my_timezone", description="Показать вашу таймзону"),
-        BotCommand(command="set_chat_timezone", description="TZ по умолчанию для этого чата"),
+        BotCommand(command="set_timezone", description="Установить Ваш часовой пояс"),
+        BotCommand(command="my_timezone", description="Показать Ваш часовой пояс"),
+        BotCommand(command="set_chat_timezone", description="Часовой пояс по умолчанию для этого чата"),
         BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
-        BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные"),
+        BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
         BotCommand(command="ping", description="Проверка связи"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
