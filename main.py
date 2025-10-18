@@ -305,7 +305,7 @@ async def cmd_list(m: Message):
         await m.answer(_row_to_line(r, user_tz_name), reply_markup=_row_buttons(r))
 
 
-@dp.callback_query(F.data.startswith(("pause:", "resume:", "del:"))))
+@dp.callback_query(F.data.startswith(("pause:", "resume:", "del:")))
 async def cb_list_actions(c: CallbackQuery):
     action, rid = c.data.split(":", 1)
     if action == "pause":
