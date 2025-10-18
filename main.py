@@ -149,11 +149,11 @@ async def cmd_set_timezone(m: Message, command: CommandObject):
     try:
         _ = ZoneInfo(arg)  # валидация
     except Exception:
-        await m.answer("Неизвестная таймзона. Проверь написание (Region/City).")
+        await m.answer("Неизвестный часовой пояс. Проверь написание (Region/City).")
         return
 
     await db.set_user_timezone(m.from_user.id, arg)
-    await m.answer(f"✅ Таймзона сохранена: <b>{arg}</b>")
+    await m.answer(f"✅ Часовой пояс сохранен: <b>{arg}</b>")
 
 
 @dp.message(Command("my_timezone"))
@@ -182,7 +182,7 @@ async def cmd_set_chat_timezone(m: Message, command: CommandObject):
     arg = (command.args or "").strip()
     if not arg:
         await m.answer(
-            "Укажи TZ для чата, например:\n"
+            "Укажи часовой пояс для чата, например:\n"
             "<code>/set_chat_timezone Asia/Yekaterinburg</code>\n"
             "<code>/set_chat_timezone Europe/Moscow</code>"
         )
@@ -191,11 +191,11 @@ async def cmd_set_chat_timezone(m: Message, command: CommandObject):
     try:
         _ = ZoneInfo(arg)
     except Exception:
-        await m.answer("Неизвестная таймзона. Проверь написание (Region/City).")
+        await m.answer("Неизвестный часовой пояс. Проверь написание (Region/City).")
         return
 
     await db.set_chat_timezone(m.chat.id, arg)
-    await m.answer(f"✅ Для этого чата установлена таймзона: <b>{arg}</b>")
+    await m.answer(f"✅ Для этого чата установлен часовой пояс: <b>{arg}</b>")
 
 
 # =========================
@@ -229,9 +229,9 @@ async def add_once_when(m: Message, state: FSMContext):
     user_tz = await effective_tz(m.from_user.id, m.chat.id)
     if not user_tz:
         await m.answer(
-            "Не могу определить местное время. Укажи свою TZ:\n"
+            "Не могу определить местное время. Укажи свой часовой пояс:\n"
             "<code>/set_timezone America/New_York</code>\n"
-            "или админ чата может задать TZ чата:\n"
+            "или админ чата может задать часовой пояс чата:\n"
             "<code>/set_chat_timezone Asia/Yekaterinburg</code>"
         )
         return
@@ -289,9 +289,9 @@ async def add_cron_spec(m: Message, state: FSMContext):
     user_tz = await effective_tz(m.from_user.id, m.chat.id)
     if not user_tz:
         await m.answer(
-            "Не могу определить местное время. Укажи свою TZ:\n"
+            "Не могу определить местное время. Укажи свой часовой пояс:\n"
             "<code>/set_timezone America/New_York</code>\n"
-            "или админ чата может задать TZ чата:\n"
+            "или админ чата может задать часовой пояс чата:\n"
             "<code>/set_chat_timezone Asia/Yekaterinburg</code>"
         )
         return
