@@ -194,7 +194,6 @@ async def add_once_when(m: Message, state: FSMContext):
     remind_at_utc = to_utc(when_local, user_tz)
     try:
         _ = await db.create_once(m.chat.id, m.from_user.id, text, remind_at_utc)
-        await state.clear()
     except Exception as e:
         logging.exception("CREATE once failed")
         await m.answer(f"⚠️ Не удалось сохранить напоминание: {e}")
