@@ -30,7 +30,7 @@ from time_parse import (
     parse_repeat_spec,
     to_utc,
     format_local_time,
-    DEFAULT_TZ,  # обычно Europe/Moscow (МСК)
+    DEFAULT_TZ,  # обычно Europe/Moscow (МСК) — используется для турниров
 )
 from texts import *
 from texts import TOURNEY_TEMPLATES
@@ -42,43 +42,9 @@ log = logging.getLogger("remindly")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_USER_ID = os.getenv("OWNER_USER_ID", "0")
 
-# Фолбэк-TZ из переменной окружения, если пользователь себе ещё не сохранил.
-USER_TZ_FALLBACK = os.getenv("USER_TZ", None)
-
 # aiogram 3.7+: parse_mode через DefaultBotProperties
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-
-
-# =========================
-# Вспомогательные функции TZ
-# =========================
-async def tz_for_user(user_id: int) -> ZoneInfo:
-    """
-    Возвращает предпочтительную TZ пользователя.
-    Порядок:
-      1) tg_users.timezone (если установлена)
-      2) USER_TZ (из env), если задана и валидна
-      3) DEFAULT_TZ (например, Europe/Moscow)
-    """
-    tz_name = await db.get_user_timezone(user_id)
-    if tz_name:
-        try:
-            return ZoneInfo(tz_name)
-        except Exception:
-            pass
-    if USER_TZ_FALLBACK:
-        try:
-            return ZoneInfo(USER_TZ_FALLBACK)
-        except Exception:
-            pass
-    return DEFAULT_TZ
-
-
-def tz_key(tz: ZoneInfo) -> str:
-    """Красивое имя зоны, например 'America/New_York'."""
-    # У ZoneInfo есть атрибут key, но на старых версиях Python может отсутствовать
-    return getattr(tz, "key", str(tz))
 
 
 # =========================
@@ -95,7 +61,55 @@ class AddCron(StatesGroup):
 
 
 # =========================
-# Команды общие
+# TZ utils
+# =========================
+async def tz_for_user_only(user_id: int) -> ZoneInfo | None:
+    """
+    Возвращает TZ, сохранённую пользователем, либо None.
+    """
+    tz_name = await db.get_user_timezone(user_id)
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return None
+
+
+async def effective_tz(user_id: int, chat_id: int) -> ZoneInfo | None:
+    """
+    Эффективная TZ:
+    1) персональная TZ пользователя (tg_users.timezone)
+    2) default_timezone чата (chats.default_timezone)
+    Если обе не заданы — None (попросим пользователя/админа указать).
+    """
+    # user TZ
+    utz = await tz_for_user_only(user_id)
+    if utz:
+        return utz
+    # chat TZ
+    ctz_name = await db.get_chat_timezone(chat_id)
+    if ctz_name:
+        try:
+            return ZoneInfo(ctz_name)
+        except Exception:
+            return None
+    return None
+
+
+def tz_key(tz: ZoneInfo) -> str:
+    """Вернуть ключ TZ, например 'America/New_York'."""
+    return getattr(tz, "key", str(tz))
+
+
+def _owner_guard(m: Message) -> bool:
+    if m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return is_owner(m.from_user.id, OWNER_USER_ID)
+    return True
+
+
+# =========================
+# Общие команды
 # =========================
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
@@ -113,21 +127,15 @@ async def cmd_ping(m: Message):
     await m.answer(PING)
 
 
-def _owner_guard(m: Message) -> bool:
-    if m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        return is_owner(m.from_user.id, OWNER_USER_ID)
-    return True
-
-
 # =========================
-# Управление таймзоной
+# Управление таймзонами
 # =========================
 @dp.message(Command("set_timezone"))
 async def cmd_set_timezone(m: Message, command: CommandObject):
     """
     /set_timezone Europe/Moscow
     /set_timezone America/New_York
-    /set_timezone Asia/Krasnoyarsk
+    /set_timezone Asia/Yekaterinburg
     """
     arg = (command.args or "").strip()
     if not arg:
@@ -135,13 +143,13 @@ async def cmd_set_timezone(m: Message, command: CommandObject):
             "Укажи таймзону, например:\n"
             "<code>/set_timezone Europe/Moscow</code>\n"
             "<code>/set_timezone America/New_York</code>\n"
-            "<code>/set_timezone Asia/Krasnoyarsk</code>"
+            "<code>/set_timezone Asia/Yekaterinburg</code>"
         )
         return
     try:
         _ = ZoneInfo(arg)  # валидация
     except Exception:
-        await m.answer("Неизвестная таймзона. Посмотри список на https://en.wikipedia.org/wiki/List_of_tz_database_time_zones")
+        await m.answer("Неизвестная таймзона. Проверь написание (Region/City).")
         return
 
     await db.set_user_timezone(m.from_user.id, arg)
@@ -150,8 +158,44 @@ async def cmd_set_timezone(m: Message, command: CommandObject):
 
 @dp.message(Command("my_timezone"))
 async def cmd_my_timezone(m: Message):
-    tz = await tz_for_user(m.from_user.id)
-    await m.answer(f"Твоя текущая таймзона: <b>{tz_key(tz)}</b>")
+    utz = await tz_for_user_only(m.from_user.id)
+    ctz = await db.get_chat_timezone(m.chat.id)
+    eff = await effective_tz(m.from_user.id, m.chat.id)
+    await m.answer(
+        "🕒 Твои TZ-настройки:\n"
+        f"• Личная: <b>{tz_key(utz) if utz else '—'}</b>\n"
+        f"• TZ чата: <b>{ctz or '—'}</b>\n"
+        f"• Эффективная: <b>{tz_key(eff) if eff else 'не установлена'}</b>"
+    )
+
+
+@dp.message(Command("set_chat_timezone"))
+async def cmd_set_chat_timezone(m: Message, command: CommandObject):
+    """
+    Установка дефолтной TZ для чата (используется, когда у пользователя личная TZ не задана).
+    Доступна только владельцу (по твоей логике _owner_guard).
+    """
+    if not _owner_guard(m):
+        await m.answer(NOT_ALLOWED)
+        return
+
+    arg = (command.args or "").strip()
+    if not arg:
+        await m.answer(
+            "Укажи TZ для чата, например:\n"
+            "<code>/set_chat_timezone Asia/Yekaterinburg</code>\n"
+            "<code>/set_chat_timezone Europe/Moscow</code>"
+        )
+        return
+
+    try:
+        _ = ZoneInfo(arg)
+    except Exception:
+        await m.answer("Неизвестная таймзона. Проверь написание (Region/City).")
+        return
+
+    await db.set_chat_timezone(m.chat.id, arg)
+    await m.answer(f"✅ Для этого чата установлена таймзона: <b>{arg}</b>")
 
 
 # =========================
@@ -182,11 +226,19 @@ async def add_once_when(m: Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
 
-    user_tz = await tz_for_user(m.from_user.id)
-    now_local = datetime.now(tz=user_tz)
+    user_tz = await effective_tz(m.from_user.id, m.chat.id)
+    if not user_tz:
+        await m.answer(
+            "Не могу определить местное время. Укажи свою TZ:\n"
+            "<code>/set_timezone America/New_York</code>\n"
+            "или админ чата может задать TZ чата:\n"
+            "<code>/set_chat_timezone Asia/Yekaterinburg</code>"
+        )
+        return
 
+    now_local = datetime.now(tz=user_tz)
     try:
-        when_local, human = parse_once_when(m.text, now_local, user_tz)
+        when_local, _ = parse_once_when(m.text, now_local, user_tz)
     except Exception as e:
         await m.answer(f"❗️ {e}")
         return
@@ -201,7 +253,7 @@ async def add_once_when(m: Message, state: FSMContext):
 
     await state.clear()
 
-    # Локальное подтверждение — в TZ пользователя
+    # Локальное подтверждение — в эффективной TZ
     local_time = format_local_time(remind_at_utc, user_tz_name=tz_key(user_tz), with_tz_abbr=True)
     await m.answer(CONFIRM_ONCE_SAVED.format(when_human=f"{local_time}"))
 
@@ -234,9 +286,17 @@ async def add_cron_spec(m: Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
 
-    user_tz = await tz_for_user(m.from_user.id)
-    now_local = datetime.now(tz=user_tz)
+    user_tz = await effective_tz(m.from_user.id, m.chat.id)
+    if not user_tz:
+        await m.answer(
+            "Не могу определить местное время. Укажи свою TZ:\n"
+            "<code>/set_timezone America/New_York</code>\n"
+            "или админ чата может задать TZ чата:\n"
+            "<code>/set_chat_timezone Asia/Yekaterinburg</code>"
+        )
+        return
 
+    now_local = datetime.now(tz=user_tz)
     try:
         cron_expr, human_suffix, next_local = parse_repeat_spec(m.text, now_local)
     except Exception as e:
@@ -297,8 +357,8 @@ async def cmd_list(m: Message):
         await m.answer(LIST_EMPTY)
         return
 
-    user_tz = await tz_for_user(m.from_user.id)
-    user_tz_name = tz_key(user_tz)
+    eff = await effective_tz(m.from_user.id, m.chat.id)
+    user_tz_name = tz_key(eff) if eff else tz_key(DEFAULT_TZ)
 
     await m.answer(LIST_HEADER)
     for r in rows:
@@ -387,6 +447,7 @@ async def on_startup():
         BotCommand(command="list", description="Список напоминаний"),
         BotCommand(command="set_timezone", description="Установить вашу таймзону"),
         BotCommand(command="my_timezone", description="Показать вашу таймзону"),
+        BotCommand(command="set_chat_timezone", description="TZ по умолчанию для этого чата"),
         BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
         BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные"),
         BotCommand(command="ping", description="Проверка связи"),
@@ -396,8 +457,8 @@ async def on_startup():
 
     me = await bot.get_me()
     logging.info(
-        "Bot is up: @%s (id=%s) USER_TZ_FALLBACK=%s DEFAULT_TZ=%s",
-        me.username, me.id, USER_TZ_FALLBACK, DEFAULT_TZ.key
+        "Bot is up: @%s (id=%s) DEFAULT_TZ=%s",
+        me.username, me.id, DEFAULT_TZ.key
     )
 
     # Фоновый планировщик

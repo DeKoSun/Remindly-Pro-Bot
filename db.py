@@ -9,7 +9,7 @@ _pool: Optional[asyncpg.Pool] = None
 async def db_pool() -> asyncpg.Pool:
     """
     Singleton-пул соединений к Supabase/Postgres.
-    ВАЖНО: statement_cache_size=0 — безопасно для PgBouncer (transaction mode).
+    Важно: statement_cache_size=0 — безопасно для PgBouncer (transaction mode).
     """
     global _pool
     if _pool is None:
@@ -36,22 +36,56 @@ async def close_db_pool() -> None:
 # Chats
 # =========================
 async def upsert_chat(chat_id: int, chat_type: str, title: Optional[str]) -> None:
+    """
+    Идемпотентная регистрация чата (тип/название могут обновляться).
+    """
     pool = await db_pool()
     await pool.execute(
         """
         INSERT INTO chats (chat_id, type, title)
         VALUES ($1, $2, $3)
         ON CONFLICT (chat_id)
-        DO UPDATE SET type = EXCLUDED.type, title = EXCLUDED.title
+        DO UPDATE SET type = EXCLUDED.type, title = EXCLUDED.title, updated_at = NOW()
         """,
         chat_id, chat_type, title,
     )
+
+
+async def set_chat_timezone(chat_id: int, tz_name: str) -> None:
+    """
+    Сохранить дефолтную таймзону для чата (используется, если у пользователя своя не задана).
+    Требуется колонка: ALTER TABLE chats ADD COLUMN IF NOT EXISTS default_timezone text;
+    """
+    pool = await db_pool()
+    await pool.execute(
+        """
+        UPDATE chats
+           SET default_timezone = $2, updated_at = NOW()
+         WHERE chat_id = $1
+        """,
+        chat_id, tz_name,
+    )
+
+
+async def get_chat_timezone(chat_id: int) -> Optional[str]:
+    """
+    Вернуть дефолтную таймзону чата, если задана.
+    """
+    pool = await db_pool()
+    row = await pool.fetchrow(
+        "SELECT default_timezone FROM chats WHERE chat_id=$1",
+        chat_id,
+    )
+    return row["default_timezone"] if row and row["default_timezone"] else None
 
 
 # =========================
 # Reminders
 # =========================
 async def create_once(chat_id: int, user_id: int, text: str, remind_at_utc) -> str:
+    """
+    Создать одноразовое напоминание (время в UTC).
+    """
     pool = await db_pool()
     row = await pool.fetchrow(
         """
@@ -73,6 +107,10 @@ async def create_cron(
     category: Optional[str] = None,
     meta: Any = None,
 ) -> str:
+    """
+    Создать повторяющееся напоминание.
+    Важно: next_at хранится в UTC, локальная TZ для сдвига — в meta['tz'] (если задана).
+    """
     pool = await db_pool()
     row = await pool.fetchrow(
         """
@@ -86,6 +124,9 @@ async def create_cron(
 
 
 async def list_by_chat(chat_id: int):
+    """
+    Список напоминаний чата для /list — без лишних полей.
+    """
     pool = await db_pool()
     rows = await pool.fetch(
         """
@@ -129,8 +170,8 @@ async def delete_tournament_crons(chat_id: int) -> None:
 # =========================
 async def fetch_due(limit: int):
     """
-    Забираем наступившие напоминания. ВАЖНО: добавлен meta
-    (используется для timezone при сдвиге cron).
+    Забираем наступившие напоминания.
+    Важно: возвращаем meta — планировщик использует meta['tz'] для расчёта следующего cron.
     """
     pool = await db_pool()
     rows = await pool.fetch(
@@ -151,6 +192,9 @@ async def fetch_due(limit: int):
 
 
 async def mark_once_delivered_success(reminder_id: str) -> None:
+    """
+    Удаляем одноразовое напоминание после успешной доставки.
+    """
     pool = await db_pool()
     await pool.execute(
         "DELETE FROM reminders WHERE id=$1",
@@ -159,6 +203,9 @@ async def mark_once_delivered_success(reminder_id: str) -> None:
 
 
 async def shift_cron_next(reminder_id: str, next_at_utc) -> None:
+    """
+    Сдвигаем следующее срабатывание cron-напоминания (UTC).
+    """
     pool = await db_pool()
     await pool.execute(
         "UPDATE reminders SET next_at=$2 WHERE id=$1",
