@@ -177,7 +177,7 @@ async def add_once_text(m: Message, state: FSMContext):
     await m.answer(ASK_WHEN_ONCE)
 
 
-@dp.message(AddOnce.waiting_when))
+@dp.message(AddOnce.waiting_when)
 async def add_once_when(m: Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
