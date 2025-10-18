@@ -1,7 +1,10 @@
 # db.py
 import os
-import asyncpg
+import json
 from typing import Optional, Any
+
+import asyncpg
+
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -17,9 +20,9 @@ async def db_pool() -> asyncpg.Pool:
             dsn=os.getenv("DATABASE_URL"),
             min_size=1,
             max_size=5,
-            command_timeout=10,                  # сек
+            command_timeout=10,                   # сек
             max_inactive_connection_lifetime=300,
-            statement_cache_size=0,              # ключевое для PgBouncer
+            statement_cache_size=0,               # ключевое для PgBouncer
         )
     return _pool
 
@@ -45,7 +48,10 @@ async def upsert_chat(chat_id: int, chat_type: str, title: Optional[str]) -> Non
         INSERT INTO chats (chat_id, type, title)
         VALUES ($1, $2, $3)
         ON CONFLICT (chat_id)
-        DO UPDATE SET type = EXCLUDED.type, title = EXCLUDED.title, updated_at = NOW()
+        DO UPDATE SET
+            type = EXCLUDED.type,
+            title = EXCLUDED.title,
+            updated_at = NOW()
         """,
         chat_id, chat_type, title,
     )
@@ -60,7 +66,8 @@ async def set_chat_timezone(chat_id: int, tz_name: str) -> None:
     await pool.execute(
         """
         UPDATE chats
-           SET default_timezone = $2, updated_at = NOW()
+           SET default_timezone = $2,
+               updated_at = NOW()
          WHERE chat_id = $1
         """,
         chat_id, tz_name,
@@ -109,16 +116,21 @@ async def create_cron(
 ) -> str:
     """
     Создать повторяющееся напоминание.
-    Важно: next_at хранится в UTC, локальная TZ для сдвига — в meta['tz'] (если задана).
+    Важно:
+      - next_at хранится в UTC
+      - локальная TZ для сдвига хранится в meta['tz'] (jsonb), если задана.
     """
     pool = await db_pool()
+    # asyncpg корректнее принимает jsonb, если явно передать JSON-строку и привести к ::jsonb в SQL
+    meta_json = json.dumps(meta) if meta is not None else None
+
     row = await pool.fetchrow(
         """
         INSERT INTO reminders (chat_id, user_id, kind, text, cron_expr, next_at, paused, category, meta)
-        VALUES ($1, $2, 'cron', $3, $4, $5, FALSE, $6, $7)
+        VALUES ($1, $2, 'cron', $3, $4, $5, FALSE, $6, $7::jsonb)
         RETURNING id::text
         """,
-        chat_id, user_id, text, cron_expr, next_at_utc, category, meta,
+        chat_id, user_id, text, cron_expr, next_at_utc, category, meta_json,
     )
     return row["id"]
 
@@ -171,20 +183,30 @@ async def delete_tournament_crons(chat_id: int) -> None:
 async def fetch_due(limit: int):
     """
     Забираем наступившие напоминания.
-    Важно: возвращаем meta — планировщик использует meta['tz'] для расчёта следующего cron.
+    Возвращаем meta — планировщик использует meta['tz'] для расчёта следующего cron.
     """
     pool = await db_pool()
     rows = await pool.fetch(
         """
-        SELECT id::text, chat_id, user_id, kind, text, remind_at, cron_expr, next_at, paused, category, meta
-        FROM reminders
-        WHERE paused = FALSE
-          AND (
-                (kind='once' AND remind_at IS NOT NULL AND remind_at <= NOW())
-             OR (kind='cron' AND next_at   IS NOT NULL AND next_at   <= NOW())
-          )
-        ORDER BY COALESCE(next_at, remind_at) ASC
-        LIMIT $1
+        SELECT id::text,
+               chat_id,
+               user_id,
+               kind,
+               text,
+               remind_at,
+               cron_expr,
+               next_at,
+               paused,
+               category,
+               meta
+          FROM reminders
+         WHERE paused = FALSE
+           AND (
+                 (kind='once' AND remind_at IS NOT NULL AND remind_at <= NOW())
+              OR (kind='cron' AND next_at   IS NOT NULL AND next_at   <= NOW())
+           )
+         ORDER BY COALESCE(next_at, remind_at) ASC
+         LIMIT $1
         """,
         limit,
     )
