@@ -61,15 +61,16 @@ def _tz_from_meta(meta) -> ZoneInfo:
         return DEFAULT_TZ
 
 
-async def _process_due(bot: Bot, r):
+async def _process_due(bot: Bot, r: dict):
     rid = r["id"]
     chat_id = r["chat_id"]
     kind = r["kind"]                # 'once' | 'cron'
     text = r["text"]
-    cron_expr = r["cron_expr"]
-    next_at = r["next_at"]          # UTC-aware
+    cron_expr = r.get("cron_expr")
+    next_at = r.get("next_at")      # UTC-aware
     meta = r.get("meta")            # jsonb -> dict (или None)
-    # category = r["category"]      # сейчас не влияет на текст
+    # безопасно читаем категорию (для турнирных 'tournament')
+    category = r.get("category") or ""
 
     # Базовый текст напоминания
     message_text = REMINDER_PREFIX.format(text=text)
@@ -77,7 +78,8 @@ async def _process_due(bot: Bot, r):
     # Подпись для cron (склонение «минуту/минуты/минут»)
     suffix = ""
     if kind == "cron":
-        if category != "tournament":   
+        # Для турнирных не показываем «🔁 Повтор ...»
+        if category != "tournament":
             try:
                 suffix_human = humanize_repeat_suffix(cron_expr or "")
             except Exception:
@@ -91,7 +93,7 @@ async def _process_due(bot: Bot, r):
         await bot.send_message(
             chat_id,
             message_text + (suffix if kind == "cron" else ""),
-            # parse_mode задаётся в Bot default, но можно продублировать:
+            # parse_mode задаётся в default Bot Properties, но оставим резерв:
             parse_mode=os.getenv("PARSE_MODE", "HTML"),
         )
 
