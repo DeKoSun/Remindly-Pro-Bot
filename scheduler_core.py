@@ -77,11 +77,12 @@ async def _process_due(bot: Bot, r):
     # Подпись для cron (склонение «минуту/минуты/минут»)
     suffix = ""
     if kind == "cron":
-        try:
-            suffix_human = humanize_repeat_suffix(cron_expr or "")
-        except Exception:
-            suffix_human = "Повтор по расписанию"
-        suffix = REMINDER_CRON_SUFFIX.format(repeat_human=suffix_human)
+        if category != "tournament":   
+            try:
+                suffix_human = humanize_repeat_suffix(cron_expr or "")
+            except Exception:
+                suffix_human = "Повтор по расписанию"
+            suffix = REMINDER_CRON_SUFFIX.format(repeat_human=suffix_human)
 
     # Таймзона для расчёта следующего срабатывания (из meta или DEFAULT_TZ)
     cron_tz = _tz_from_meta(meta)
