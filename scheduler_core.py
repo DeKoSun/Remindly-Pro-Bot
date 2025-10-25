@@ -10,12 +10,12 @@ from aiogram import Bot
 
 import db
 from time_parse import (
-    DEFAULT_TZ,   # базовый TZ — обычно Europe/Moscow
+    DEFAULT_TZ,   # базовый TZ — fallback
     to_local,
     to_utc,
     humanize_repeat_suffix,
 )
-from texts import REMINDER_PREFIX, REMINDER_CRON_SUFFIX
+from texts import REMINDER_PREFIX, REMINDER_CRON_SUFFIX, tournament_phrase_by_index
 
 log = logging.getLogger(__name__)
 
@@ -70,21 +70,28 @@ async def _process_due(bot: Bot, r: dict):
     next_at = r.get("next_at")      # UTC-aware
     meta = r.get("meta")            # jsonb -> dict (или None)
     # безопасно читаем категорию (для турнирных 'tournament')
-    category = r.get("category") or ""
+    category = (r.get("category") or "").strip()
 
-    # Базовый текст напоминания
-    message_text = REMINDER_PREFIX.format(text=text)
+    # --- текст сообщения ---
+    # Для турнирных используем ротацию уникальных фраз;
+    # для остальных — общий шаблон REMINDER_PREFIX.
+    if category == "tournament":
+        kv_key = f"t_phrase_idx:{chat_id}"
+        idx = await db.kv_get_int(kv_key) or 0
+        phrase, next_idx = tournament_phrase_by_index(idx)
+        await db.kv_set_int(kv_key, next_idx)
+        message_text = phrase
+    else:
+        message_text = REMINDER_PREFIX.format(text=text)
 
-    # Подпись для cron (склонение «минуту/минуты/минут»)
+    # Подпись для cron (склонение «минуту/минуты/минут») — скрываем для турниров
     suffix = ""
-    if kind == "cron":
-        # Для турнирных не показываем «🔁 Повтор ...»
-        if category != "tournament":
-            try:
-                suffix_human = humanize_repeat_suffix(cron_expr or "")
-            except Exception:
-                suffix_human = "Повтор по расписанию"
-            suffix = REMINDER_CRON_SUFFIX.format(repeat_human=suffix_human)
+    if kind == "cron" and category != "tournament":
+        try:
+            suffix_human = humanize_repeat_suffix(cron_expr or "")
+        except Exception:
+            suffix_human = "Повтор по расписанию"
+        suffix = REMINDER_CRON_SUFFIX.format(repeat_human=suffix_human)
 
     # Таймзона для расчёта следующего срабатывания (из meta или DEFAULT_TZ)
     cron_tz = _tz_from_meta(meta)
@@ -93,7 +100,8 @@ async def _process_due(bot: Bot, r: dict):
         await bot.send_message(
             chat_id,
             message_text + (suffix if kind == "cron" else ""),
-            # parse_mode задаётся в default Bot Properties, но оставим резерв:
+            # parse_mode указывается через DefaultBotProperties в Bot(...),
+            # но оставляем резервный параметр:
             parse_mode=os.getenv("PARSE_MODE", "HTML"),
         )
 
@@ -102,16 +110,21 @@ async def _process_due(bot: Bot, r: dict):
             await db.mark_once_delivered_success(rid)
         else:
             # cron — всегда сдвигаем next_at
-            base = next_at or datetime.now(tz=ZoneInfo("UTC"))
-            # base(UTC) -> локаль (cron_tz) -> расчёт следующего -> снова UTC
-            local_base = to_local(base, cron_tz)
-            nxt_local = croniter(cron_expr, local_base).get_next(datetime)
-            nxt_utc = to_utc(nxt_local, cron_tz)
-            await db.shift_cron_next(rid, nxt_utc)
+            # если cron_expr отсутствует (некорректная запись) — пропустим сдвиг,
+            # чтобы не зациклиться
+            if not cron_expr:
+                log.warning("Cron reminder without cron_expr, rid=%s", rid)
+            else:
+                base = next_at or datetime.now(tz=ZoneInfo("UTC"))
+                # base(UTC) -> локаль (cron_tz) -> расчёт следующего -> снова UTC
+                local_base = to_local(base, cron_tz)
+                nxt_local = croniter(cron_expr, local_base).get_next(datetime)
+                nxt_utc = to_utc(nxt_local, cron_tz)
+                await db.shift_cron_next(rid, nxt_utc)
 
     except Exception as e:
         # Логируем, и чтобы не зациклиться, сдвигаем cron даже при ошибке отправки
-        if kind == "cron":
+        if kind == "cron" and cron_expr:
             try:
                 base = next_at or datetime.now(tz=ZoneInfo("UTC"))
                 local_base = to_local(base, cron_tz)

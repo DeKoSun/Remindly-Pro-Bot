@@ -122,7 +122,7 @@ async def create_cron(
     """
     pool = await db_pool()
     # asyncpg корректнее принимает jsonb, если явно передать JSON-строку и привести к ::jsonb в SQL
-    meta_json = json.dumps(meta) if meta is not None else None
+    meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
 
     row = await pool.fetchrow(
         """
@@ -282,6 +282,47 @@ async def get_user_timezone(user_id: int) -> Optional[str]:
     pool = await db_pool()
     row = await pool.fetchrow("SELECT timezone FROM tg_users WHERE user_id=$1", user_id)
     return (row["timezone"] if row and row["timezone"] else None)
+
+
+# =========================
+# KV-хранилище (универсальные настройки/счётчики)
+# =========================
+# Таблица (один раз создать в БД):
+#   create table if not exists app_settings (
+#     key   text primary key,
+#     value text not null
+#   );
+
+async def kv_get_str(key: str) -> Optional[str]:
+    pool = await db_pool()
+    row = await pool.fetchrow("SELECT value FROM app_settings WHERE key=$1", key)
+    return row["value"] if row else None
+
+
+async def kv_set_str(key: str, value: str) -> None:
+    pool = await db_pool()
+    await pool.execute(
+        """
+        INSERT INTO app_settings(key, value)
+        VALUES ($1, $2)
+        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        key, value,
+    )
+
+
+async def kv_get_int(key: str) -> Optional[int]:
+    v = await kv_get_str(key)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+async def kv_set_int(key: str, value: int) -> None:
+    await kv_set_str(key, str(value))
 
 
 # =========================
