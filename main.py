@@ -434,7 +434,7 @@ async def cmd_tourney_now(m: Message):
     Не зависит от подписки/кронов — просто публикует одно сообщение по шаблону.
     """
     text = random.choice(TOURNEY_TEMPLATES)
-    await m.answer(f"<b>Напоминание:</b>\n{text}")
+    await m.answer(f"⏰ <b>Напоминание:</b>\n\n{text}")
 
 
 # =========================
