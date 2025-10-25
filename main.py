@@ -207,14 +207,14 @@ async def _alias_add(m: Message, state: FSMContext):
     return await cmd_add(m, state)
 
 
-@dp.message(AddOnce.waiting_text))
+@dp.message(AddOnce.waiting_text)
 async def add_once_text(m: Message, state: FSMContext):
     await state.update_data(text=m.text.strip())
     await state.set_state(AddOnce.waiting_when)
     await m.answer(ASK_WHEN_ONCE)
 
 
-@dp.message(AddOnce.waiting_when))
+@dp.message(AddOnce.waiting_when)
 async def add_once_when(m: Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
@@ -267,14 +267,14 @@ async def cmd_repeat_alias(m: Message, state: FSMContext):
     return await cmd_repeat(m, state)
 
 
-@dp.message(AddCron.waiting_text))
+@dp.message(AddCron.waiting_text)
 async def add_cron_text(m: Message, state: FSMContext):
     await state.update_data(text=m.text.strip())
     await state.set_state(AddCron.waiting_spec)
     await m.answer(ASK_SPEC_CRON)
 
 
-@dp.message(AddCron.waiting_spec))
+@dp.message(AddCron.waiting_spec)
 async def add_cron_spec(m: Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
