@@ -69,12 +69,10 @@ async def _process_due(bot: Bot, r: dict):
     cron_expr = r.get("cron_expr")
     next_at = r.get("next_at")      # UTC-aware
     meta = r.get("meta")            # jsonb -> dict (или None)
-    # безопасно читаем категорию (для турнирных 'tournament')
-    category = (r.get("category") or "").strip()
+    category = (r.get("category") or "").strip()  # 'tournament' для турнирных
 
     # --- текст сообщения ---
-    # Для турнирных используем ротацию уникальных фраз;
-    # для остальных — общий шаблон REMINDER_PREFIX.
+    # Турниры: ротация уникальных фраз; иначе — общий шаблон
     if category == "tournament":
         kv_key = f"t_phrase_idx:{chat_id}"
         idx = await db.kv_get_int(kv_key) or 0
@@ -100,18 +98,16 @@ async def _process_due(bot: Bot, r: dict):
         await bot.send_message(
             chat_id,
             message_text + (suffix if kind == "cron" else ""),
-            # parse_mode указывается через DefaultBotProperties в Bot(...),
-            # но оставляем резервный параметр:
+            # parse_mode задан через DefaultBotProperties при создании Bot,
+            # оставляем резервный параметр на случай переопределения:
             parse_mode=os.getenv("PARSE_MODE", "HTML"),
         )
 
         if kind == "once":
-            # одноразовое — удаляем по успеху
+            # одноразовое — помечаем доставленным
             await db.mark_once_delivered_success(rid)
         else:
-            # cron — всегда сдвигаем next_at
-            # если cron_expr отсутствует (некорректная запись) — пропустим сдвиг,
-            # чтобы не зациклиться
+            # cron — сдвигаем next_at
             if not cron_expr:
                 log.warning("Cron reminder without cron_expr, rid=%s", rid)
             else:
@@ -123,7 +119,7 @@ async def _process_due(bot: Bot, r: dict):
                 await db.shift_cron_next(rid, nxt_utc)
 
     except Exception as e:
-        # Логируем, и чтобы не зациклиться, сдвигаем cron даже при ошибке отправки
+        # Чтобы не зациклиться, пробуем сдвинуть cron даже при ошибке отправки
         if kind == "cron" and cron_expr:
             try:
                 base = next_at or datetime.now(tz=ZoneInfo("UTC"))

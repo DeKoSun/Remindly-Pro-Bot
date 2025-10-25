@@ -64,9 +64,7 @@ class AddCron(StatesGroup):
 # TZ utils
 # =========================
 async def tz_for_user_only(user_id: int) -> ZoneInfo | None:
-    """
-    Возвращает TZ, сохранённую пользователем, либо None.
-    """
+    """Возвращает TZ, сохранённую пользователем, либо None."""
     tz_name = await db.get_user_timezone(user_id)
     if not tz_name:
         return None
@@ -79,15 +77,13 @@ async def tz_for_user_only(user_id: int) -> ZoneInfo | None:
 async def effective_tz(user_id: int, chat_id: int) -> ZoneInfo | None:
     """
     Эффективная TZ:
-    1) персональная TZ пользователя (tg_users.timezone)
-    2) default_timezone чата (chats.default_timezone)
+      1) персональная TZ пользователя (tg_users.timezone)
+      2) default_timezone чата (chats.default_timezone)
     Если обе не заданы — None (попросим пользователя/админа указать).
     """
-    # user TZ
     utz = await tz_for_user_only(user_id)
     if utz:
         return utz
-    # chat TZ
     ctz_name = await db.get_chat_timezone(chat_id)
     if ctz_name:
         try:
@@ -171,10 +167,7 @@ async def cmd_my_timezone(m: Message):
 
 @dp.message(Command("set_chat_timezone"))
 async def cmd_set_chat_timezone(m: Message, command: CommandObject):
-    """
-    Установка дефолтной TZ для чата (используется, когда у пользователя личная TZ не задана).
-    Доступна только владельцу (по твоей логике _owner_guard).
-    """
+    """Установка дефолтной TZ для чата (используется, когда у пользователя личная TZ не задана)."""
     if not _owner_guard(m):
         await m.answer(NOT_ALLOWED)
         return
@@ -214,14 +207,14 @@ async def _alias_add(m: Message, state: FSMContext):
     return await cmd_add(m, state)
 
 
-@dp.message(AddOnce.waiting_text)
+@dp.message(AddOnce.waiting_text))
 async def add_once_text(m: Message, state: FSMContext):
     await state.update_data(text=m.text.strip())
     await state.set_state(AddOnce.waiting_when)
     await m.answer(ASK_WHEN_ONCE)
 
 
-@dp.message(AddOnce.waiting_when)
+@dp.message(AddOnce.waiting_when))
 async def add_once_when(m: Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
@@ -274,14 +267,14 @@ async def cmd_repeat_alias(m: Message, state: FSMContext):
     return await cmd_repeat(m, state)
 
 
-@dp.message(AddCron.waiting_text)
+@dp.message(AddCron.waiting_text))
 async def add_cron_text(m: Message, state: FSMContext):
     await state.update_data(text=m.text.strip())
     await state.set_state(AddCron.waiting_spec)
     await m.answer(ASK_SPEC_CRON)
 
 
-@dp.message(AddCron.waiting_spec)
+@dp.message(AddCron.waiting_spec))
 async def add_cron_spec(m: Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
@@ -388,7 +381,7 @@ async def cb_list_actions(c: CallbackQuery):
 # =========================
 def _tournament_crons_local():
     """
-    Напоминания за 5 минут до старта "Быстрого турнира" по МСК.
+    Напоминания за 5 минут до старта «Быстрого турнира» по МСК.
     Старты: 14:00,16:00,18:00,20:00,22:00,00:00
     Отправляем в 13:55,15:55,17:55,19:55,21:55,23:55 (МСК).
     Возвращаем cron в МЕСТНОМ (DEFAULT_TZ=MSK) времени.
@@ -409,7 +402,6 @@ async def _install_tournament_crons_for_chat(chat_id: int, user_id: int):
         text = random.choice(TOURNEY_TEMPLATES)
         meta = {"tz": "Europe/Moscow"}
         await db.create_cron(chat_id, user_id, text, expr, next_utc, category="tournament", meta=meta)
-
 
 
 @dp.message(Command("subscribe_tournaments"))
@@ -434,6 +426,17 @@ async def cmd_unsub(m: Message):
     await m.answer(SUB_OFF)
 
 
+# ======= NEW: мгновенный турнирный пинг =======
+@dp.message(Command("tourney_now"))
+async def cmd_tourney_now(m: Message):
+    """
+    Ручной мгновенный пинг «Быстрого турнира».
+    Не зависит от подписки/кронов — просто публикует одно сообщение по шаблону.
+    """
+    text = random.choice(TOURNEY_TEMPLATES)
+    await m.answer(f"<b>Напоминание:</b>\n{text}")
+
+
 # =========================
 # Запуск
 # =========================
@@ -452,16 +455,14 @@ async def on_startup():
         BotCommand(command="set_chat_timezone", description="Часовой пояс по умолчанию для этого чата"),
         BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
         BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
+        BotCommand(command="tourney_now", description="Сразу турнирное напоминание"),
         BotCommand(command="ping", description="Проверка связи"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
     await bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
 
     me = await bot.get_me()
-    logging.info(
-        "Bot is up: @%s (id=%s) DEFAULT_TZ=%s",
-        me.username, me.id, DEFAULT_TZ.key
-    )
+    logging.info("Bot is up: @%s (id=%s) DEFAULT_TZ=%s", me.username, me.id, DEFAULT_TZ.key)
 
     # Фоновый планировщик
     asyncio.create_task(delivery_loop(bot))

@@ -22,7 +22,7 @@ async def db_pool() -> asyncpg.Pool:
             max_size=5,
             command_timeout=10,                   # сек
             max_inactive_connection_lifetime=300,
-            statement_cache_size=0,               # ключевое для PgBouncer
+            statement_cache_size=0,               # критично для PgBouncer
         )
     return _pool
 
@@ -155,7 +155,7 @@ async def list_by_chat(chat_id: int):
 async def set_paused(reminder_id: str, paused: bool) -> None:
     pool = await db_pool()
     await pool.execute(
-        "UPDATE reminders SET paused=$2 WHERE id=$1",
+        "UPDATE reminders SET paused=$2, updated_at=NOW() WHERE id=$1",
         reminder_id, paused,
     )
 
@@ -230,7 +230,7 @@ async def shift_cron_next(reminder_id: str, next_at_utc) -> None:
     """
     pool = await db_pool()
     await pool.execute(
-        "UPDATE reminders SET next_at=$2 WHERE id=$1",
+        "UPDATE reminders SET next_at=$2, updated_at=NOW() WHERE id=$1",
         reminder_id, next_at_utc,
     )
 
