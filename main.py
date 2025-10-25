@@ -407,7 +407,9 @@ async def _install_tournament_crons_for_chat(chat_id: int, user_id: int):
         next_local = croniter(expr, now_local).get_next(datetime)  # в МСК
         next_utc = to_utc(next_local, DEFAULT_TZ)                  # храним в UTC
         text = random.choice(TOURNEY_TEMPLATES)
-        await db.create_cron(chat_id, user_id, text, expr, next_utc, category="tournament")
+        meta = {"tz": "Europe/Moscow"}
+        await db.create_cron(chat_id, user_id, text, expr, next_utc, category="tournament", meta=meta)
+
 
 
 @dp.message(Command("subscribe_tournaments"))
