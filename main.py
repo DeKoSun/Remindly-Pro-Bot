@@ -19,6 +19,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
     BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
 )
 
 from croniter import croniter
@@ -30,7 +31,7 @@ from time_parse import (
     parse_repeat_spec,
     to_utc,
     format_local_time,
-    DEFAULT_TZ,  # обычно Europe/Moscow (МСК) — используется для турниров
+    DEFAULT_TZ,  # Europe/Moscow — базовая TZ для турнирных кронов
 )
 from texts import *
 from texts import TOURNEY_TEMPLATES
@@ -426,15 +427,65 @@ async def cmd_unsub(m: Message):
     await m.answer(SUB_OFF)
 
 
-# ======= NEW: мгновенный турнирный пинг =======
+# ======= Админ: мгновенный турнирный пинг (скрытая команда) =======
 @dp.message(Command("tourney_now"))
 async def cmd_tourney_now(m: Message):
     """
     Ручной мгновенный пинг «Быстрого турнира».
-    Не зависит от подписки/кронов — просто публикует одно сообщение по шаблону.
+    Фразы уже содержат нужный префикс/отступы (из texts.py) — НЕ оборачиваем дополнительно.
     """
+    if not _owner_guard(m):
+        await m.answer(NOT_ALLOWED)
+        return
     text = random.choice(TOURNEY_TEMPLATES)
-    await m.answer(f"⏰ <b>Напоминание:</b>\n\n{text}")
+    await m.answer(text)
+
+
+# =========================
+# Команды в меню (вариант A со скоупами)
+# =========================
+async def set_commands(bot: Bot):
+    # Приватные чаты: полный набор для пользователей
+    private_cmds = [
+        BotCommand(command="start", description="Запустить бота и подсказки"),
+        BotCommand(command="help", description="Показать доступные команды"),
+        BotCommand(command="add", description="Одноразовое напоминание"),
+        BotCommand(command="repeat", description="Повторяющееся напоминание"),
+        BotCommand(command="list", description="Список/пауза/удаление"),
+        BotCommand(command="set_timezone", description="Установить свой часовой пояс"),
+        BotCommand(command="my_timezone", description="Показать свой часовой пояс"),
+        BotCommand(command="ping", description="Проверка связи"),
+        # Скрытые: не добавляем сюда (например, tourney_now)
+    ]
+    await bot.set_my_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
+
+    # Группы: команды, полезные в группах
+    group_cmds = [
+        BotCommand(command="add", description="Одноразовое напоминание"),
+        BotCommand(command="repeat", description="Повторяющееся напоминание"),
+        BotCommand(command="list", description="Список напоминаний, пауза/возобновление/удаление"),
+        BotCommand(command="set_timezone", description="Установить свой часовой пояс"),
+        BotCommand(command="my_timezone", description="Показать свой часовой пояс"),
+        BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
+        BotCommand(command="unsubscribe_tournaments", description="Отключить турнирные напоминания"),
+        # tourney_now — скрыта из меню
+    ]
+    await bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
+
+    # На всякий случай дефолтный скоуп (если Telegram-клиент проигнорирует частные):
+    default_cmds = [
+        BotCommand(command="help", description="Список доступных команд"),
+        BotCommand(command="add", description="Одноразовое напоминание"),
+        BotCommand(command="repeat", description="Повторяющееся напоминание"),
+        BotCommand(command="list", description="Список/пауза/удаление"),
+        BotCommand(command="set_timezone", description="Установить свой часовой пояс"),
+        BotCommand(command="my_timezone", description="Показать свой часовой пояс"),
+        BotCommand(command="set_chat_timezone", description="Часовой пояс чата"),
+        BotCommand(command="subscribe_tournaments", description="Включить турнирные"),
+        BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные"),
+        BotCommand(command="ping", description="Проверка связи"),
+    ]
+    await bot.set_my_commands(default_cmds, scope=BotCommandScopeDefault())
 
 
 # =========================
@@ -444,22 +495,8 @@ async def on_startup():
     # Переключаемся на polling (снимаем вебхук)
     await bot.delete_webhook(drop_pending_updates=False)
 
-    # Меню команд (и в ЛС, и в группах)
-    cmds = [
-        BotCommand(command="help", description="Список доступных команд"),
-        BotCommand(command="add", description="Одноразовое напоминание"),
-        BotCommand(command="repeat", description="Повторяющееся напоминание"),
-        BotCommand(command="list", description="Список напоминаний"),
-        BotCommand(command="set_timezone", description="Установить Ваш часовой пояс"),
-        BotCommand(command="my_timezone", description="Показать Ваш часовой пояс"),
-        BotCommand(command="set_chat_timezone", description="Часовой пояс по умолчанию для этого чата"),
-        BotCommand(command="subscribe_tournaments", description="Включить турнирные напоминания"),
-        BotCommand(command="unsubscribe_tournaments", description="Выключить турнирные напоминания"),
-        BotCommand(command="tourney_now", description="Сразу турнирное напоминание"),
-        BotCommand(command="ping", description="Проверка связи"),
-    ]
-    await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
-    await bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
+    # Устанавливаем команды (скоупы: приватные, группы, дефолт)
+    await set_commands(bot)
 
     me = await bot.get_me()
     logging.info("Bot is up: @%s (id=%s) DEFAULT_TZ=%s", me.username, me.id, DEFAULT_TZ.key)
