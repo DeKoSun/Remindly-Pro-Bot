@@ -388,7 +388,7 @@ def _tournament_crons_local():
     Возвращаем cron в МЕСТНОМ (DEFAULT_TZ=MSK) времени.
     """
     times = [(13, 55), (15, 55), (17, 55), (19, 55), (21, 55), (23, 55)]
-    return [f"{mm} {hh} * * *" for hh, mm in times]
+    return [f"{mm} {(hh + 1) % 24} * * *" for hh, mm in base]
 
 
 async def _install_tournament_crons_for_chat(chat_id: int, user_id: int):
